@@ -2079,6 +2079,7 @@ fn session_worker_with_connector(
         // the previous connection must not block server-directed recovery.
         // Explicit attachment-mismatch retries already live in `pending`.
         let mut unaccepted_sends = VecDeque::new();
+        let mut pending_model: Option<String> = None;
         let mut retry_countdown = None;
         eprintln!("jcode desktop: session {session_id} connected");
         let _ = updates.send(Update::SessionConnected {
@@ -2302,11 +2303,22 @@ fn session_worker_with_connector(
                         }
                     },
                     SessionCommand::SetModel(model) => {
-                        if let Err(error) = client.set_model(real_id, &model) {
-                            let _ = updates.send(Update::CommandFailed {
-                                session_id: session_id.clone(),
-                                reason: format!("Failed to switch model: {error}"),
-                            });
+                        if turn_active || !unaccepted_sends.is_empty() {
+                            // The server defers `set_model` until the active
+                            // turn releases the agent lock. Sending it now
+                            // would block this worker loop for up to the SDK's
+                            // 30s request timeout, stalling live stream events
+                            // and surfacing a false timeout error even though
+                            // the switch succeeds when the turn ends.
+                            pending_model = Some(model);
+                        } else {
+                            pending_model = None;
+                            if let Err(error) = client.set_model(real_id, &model) {
+                                let _ = updates.send(Update::CommandFailed {
+                                    session_id: session_id.clone(),
+                                    reason: format!("Failed to switch model: {error}"),
+                                });
+                            }
                         }
                     }
                     SessionCommand::RuntimeCommand(command, args) => {
@@ -2423,6 +2435,17 @@ fn session_worker_with_connector(
                 }
             } else {
                 retry_countdown = None;
+            }
+
+            if !turn_active && unaccepted_sends.is_empty() {
+                if let Some(model) = pending_model.take() {
+                    if let Err(error) = client.set_model(real_id, &model) {
+                        let _ = updates.send(Update::CommandFailed {
+                            session_id: session_id.clone(),
+                            reason: format!("Failed to switch model: {error}"),
+                        });
+                    }
+                }
             }
 
             // A transient turn failure scheduled an automatic continuation.

@@ -247,9 +247,6 @@ fn remote_worker_routes_every_native_operation_and_namespaces_outputs() {
 
     commands.send(SessionCommand::Cancel).unwrap();
     commands
-        .send(SessionCommand::SetModel("model".into()))
-        .unwrap();
-    commands
         .send(SessionCommand::Operation(SessionOperation::Clear))
         .unwrap();
     commands
@@ -275,7 +272,6 @@ fn remote_worker_routes_every_native_operation_and_namespaces_outputs() {
     commands.send(SessionCommand::Transfer).unwrap();
     for expected in [
         "cancel",
-        "set_model",
         "clear",
         "compact",
         "set_reasoning_effort",
@@ -330,6 +326,13 @@ fn remote_worker_routes_every_native_operation_and_namespaces_outputs() {
             }
         )
     });
+    commands
+        .send(SessionCommand::SetModel("model".into()))
+        .unwrap();
+    assert!(matches!(
+        server.next(),
+        ApiRequest::SetModel { session_id, model } if session_id == "same-id" && model == "model"
+    ));
     commands.send(SessionCommand::Stop).unwrap();
     worker.join().unwrap();
     assert!(
@@ -663,4 +666,75 @@ fn managed_cloud_live_session_answers_a_prompt() {
     );
     drop(client);
     drop(printer);
+}
+
+#[test]
+fn set_model_during_active_turn_defers_until_turn_done_without_blocking_stream() {
+    let ui_id = remote::namespace("user@desktop", "same-id");
+    let (commands, rx) = channel();
+    let (tx, updates) = update_channel();
+    let (client, server) = Server::new();
+    let mut client = Some(client);
+    let worker_id = ui_id.clone();
+    let worker = std::thread::spawn(move || {
+        session_worker_with_connector(worker_id, rx, tx, None, |_| Ok(client.take().unwrap()));
+    });
+
+    assert!(matches!(server.next(), ApiRequest::AttachSession { .. }));
+    assert!(matches!(server.next(), ApiRequest::GetHistory { .. }));
+    assert!(matches!(server.next(), ApiRequest::GetRuntimeInfo { .. }));
+    wait_update(&updates, |u| matches!(u, Update::SessionConnected { .. }));
+
+    // Start a turn.
+    commands
+        .send(SessionCommand::Send {
+            content: "hello".into(),
+            images: vec![],
+        })
+        .unwrap();
+    assert!(matches!(server.next(), ApiRequest::SendMessage { .. }));
+    wait_update(&updates, |u| matches!(u, Update::MessageSubmitted { .. }));
+
+    // Request two model switches while the turn is active. Neither should be
+    // sent yet, and streaming events must continue arriving without stalling.
+    commands
+        .send(SessionCommand::SetModel("openai-api:gpt-6-luna".into()))
+        .unwrap();
+    commands
+        .send(SessionCommand::SetModel("openai-api:gpt-6-astra".into()))
+        .unwrap();
+
+    server.event(ApiEvent::MessageAccepted {
+        session_id: "same-id".into(),
+    });
+    server.event(ApiEvent::TextDelta {
+        message_id: None,
+        session_id: "same-id".into(),
+        text: "streaming".into(),
+    });
+    wait_update(&updates, |u| {
+        matches!(
+            u,
+            Update::Event {
+                event: ApiEvent::TextDelta { text, .. },
+                ..
+            } if text == "streaming"
+        )
+    });
+
+    // Finish the turn; only the latest requested model should now be sent.
+    server.event(ApiEvent::TurnDone {
+        session_id: "same-id".into(),
+        pending_soft_interrupts: None,
+    });
+    assert!(matches!(
+        server.next(),
+        ApiRequest::SetModel { session_id, model }
+        if session_id == "same-id" && model == "openai-api:gpt-6-astra"
+    ));
+
+    commands.send(SessionCommand::Stop).unwrap();
+    worker.join().unwrap();
+    assert!(matches!(server.next(), ApiRequest::DetachSession { .. }));
+    server.disconnect();
 }
