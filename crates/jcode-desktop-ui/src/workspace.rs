@@ -5483,6 +5483,8 @@ impl Workspace {
             .bottom_0()
             .right(px(-outset))
             .w(px(crate::scrollbar::GUTTER))
+            .opacity(0.25)
+            .hover(|el| el.opacity(0.65))
             // The gutter is a sibling overlay, not part of the scrollable
             // content. Handle its wheel input just like the folder-tab strip,
             // and consume it so the list underneath cannot scroll twice.
