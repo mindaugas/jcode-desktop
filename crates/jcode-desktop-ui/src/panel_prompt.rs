@@ -371,6 +371,8 @@ impl Panel {
                 .flex_none()
                 .relative()
                 .w_full()
+                .max_w(px(1120.))
+                .mx_auto()
                 .min_w_0()
                 // Match the reading surface without overlaying transcript ink.
                 .bg(background)
@@ -1363,6 +1365,52 @@ mod tests {
         assert_eq!(
             prompt.bottom(),
             vcx.debug_bounds("transcript").unwrap().top()
+        );
+    }
+
+    #[gpui::test]
+    fn pinned_prompt_aligns_with_centered_transcript_column(cx: &mut gpui::TestAppContext) {
+        let (panel, vcx) = cx.add_window_view(|_, cx| {
+            Panel::new(
+                "pinned-prompt-align".into(),
+                None,
+                None,
+                crate::harness::spawn_inert(),
+                cx,
+            )
+        });
+        let handle = vcx.update(|window, _| window.window_handle());
+        vcx.simulate_window_resize(handle, gpui::size(px(1600.), px(800.)));
+        panel.update(vcx, |panel, cx| {
+            *panel.items = vec![
+                Item::User("Check the centered alignment on a wide window.".into()),
+                Item::Assistant("Aligned with the 1120px transcript column.".into()),
+            ];
+            cx.notify();
+        });
+        vcx.run_until_parked();
+
+        let prompt = vcx
+            .debug_bounds("pinned-latest-prompt")
+            .expect("pinned prompt should render");
+        let row = vcx
+            .debug_bounds("transcript-row-0")
+            .expect("first transcript row should render");
+
+        assert_eq!(
+            prompt.size.width,
+            px(1120.),
+            "pinned prompt should cap at the 1120px chat column width"
+        );
+        assert_eq!(
+            prompt.left(),
+            row.left(),
+            "pinned prompt left edge should align with the transcript column"
+        );
+        assert_eq!(
+            prompt.right(),
+            row.right(),
+            "pinned prompt right edge should align with the transcript column"
         );
     }
 }
