@@ -567,6 +567,16 @@ fn detach_console() {}
 
 fn main() {
     attach_parent_console();
+    let startup = std::time::Instant::now();
+    let trace_startup = env::var_os("JCODE_DESKTOP_TRACE_STARTUP").is_some();
+    let checkpoint = move |stage: &str| {
+        if trace_startup {
+            eprintln!(
+                "desktop startup: {stage} {:.3}ms",
+                startup.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    };
     if let Some(code) = jcode_desktop_ui::run_restart_worker_if_requested() {
         std::process::exit(code);
     }
@@ -631,6 +641,7 @@ fn main() {
         };
     let instance_socket = Rc::new(instance_socket);
     let plugin_path = host::reload_config::plugin_path();
+    checkpoint("instance-ready");
     let app = application().with_quit_mode(launch_quit_mode(
         launch_mode,
         env::var("JCODE_DESKTOP_SCREENSHOT").as_deref() == Ok("1"),
@@ -654,7 +665,9 @@ fn main() {
             }
         }
     });
+    checkpoint("platform-ready");
     app.run(move |cx: &mut App| {
+        checkpoint("app-run");
         let quit_socket = instance_socket.clone();
         cx.on_app_quit(move |_| {
             quit_socket.cleanup();
@@ -683,6 +696,7 @@ fn main() {
             )
             .expect("failed to open native Jcode Desktop window");
 
+        checkpoint("window-open");
         let host = Rc::new(HostState::default());
         let manager = Rc::new(RefCell::new(
             ReloadManager::new(
@@ -868,6 +882,7 @@ fn main() {
             .borrow_mut()
             .activate_initial(cx)
             .expect("activate linked Jcode Desktop UI");
+        checkpoint("ui-activated");
         if let Some(path) = plugin_path.as_ref() {
             eprintln!(
                 "Jcode Desktop hot reload enabled: Ctrl+R rebuilds and reloads the latest UI from {}; Ctrl+Shift+R does the same; F6 rolls back",
