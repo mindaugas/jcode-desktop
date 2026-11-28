@@ -1,5 +1,38 @@
+#[derive(Clone)]
+pub struct ReloadReply(
+    std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<Result<(), String>>>>>,
+);
+
+impl ReloadReply {
+    #[cfg(unix)]
+    fn new(tx: std::sync::mpsc::Sender<Result<(), String>>) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(Some(tx))))
+    }
+
+    pub fn send(&self, result: Result<(), String>) {
+        if let Some(tx) = self.0.lock().unwrap().take() {
+            let _ = tx.send(result);
+        }
+    }
+}
+
+impl std::fmt::Debug for ReloadReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReloadReply(..)")
+    }
+}
+
+impl PartialEq for ReloadReply {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ReloadReply {}
+
 #[cfg(unix)]
 mod platform {
+    use super::ReloadReply;
     use jcode_desktop_api::WindowLaunch;
     use std::{
         fs,
@@ -19,6 +52,7 @@ mod platform {
 
     const SHOW: u8 = b'S';
     const RELOAD: u8 = b'R';
+    const RELOAD_WAIT: u8 = b'C';
     const TOGGLE_VOICE: u8 = b'V';
     const VOICE_PRESS: u8 = b'P';
     const VOICE_RELEASE: u8 = b'U';
@@ -31,6 +65,8 @@ mod platform {
     pub enum Command {
         Show,
         Reload,
+        /// Rebuild and reload the UI, then reply with `Ok(())` or `Err(reason)`.
+        ReloadAndWait(ReloadReply),
         ToggleVoice,
         VoicePress,
         VoiceRelease,
@@ -126,6 +162,7 @@ mod platform {
         let mut message = vec![match &command {
             Command::Show => SHOW,
             Command::Reload => RELOAD,
+            Command::ReloadAndWait(_) => RELOAD_WAIT,
             Command::ToggleVoice => TOGGLE_VOICE,
             Command::VoicePress => VOICE_PRESS,
             Command::VoiceRelease => VOICE_RELEASE,
@@ -162,6 +199,28 @@ mod platform {
             let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
             let mut command = [0; 1];
             if stream.read_exact(&mut command).is_ok() {
+                if command[0] == RELOAD_WAIT {
+                    let (tx, rx) = mpsc::channel();
+                    if commands
+                        .send(Command::ReloadAndWait(ReloadReply::new(tx)))
+                        .is_ok()
+                    {
+                        thread::spawn(move || {
+                            let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+                            let response = match rx.recv() {
+                                Ok(Ok(())) => OK.to_vec(),
+                                Ok(Err(err)) => {
+                                    format!("err:{}\n", err.replace(['\r', '\n'], " ")).into_bytes()
+                                }
+                                Err(_) => {
+                                    b"err:desktop host closed before reload finished\n".to_vec()
+                                }
+                            };
+                            let _ = stream.write_all(&response);
+                        });
+                    }
+                    continue;
+                }
                 let command = match command[0] {
                     SHOW => Command::Show,
                     RELOAD => Command::Reload,
@@ -302,6 +361,64 @@ mod platform {
             }
             drop(hosts);
             assert!(names.iter().all(|name| !root.path().join(name).exists()));
+        }
+
+        #[test]
+        fn reload_wait_replies_only_after_completion_and_reports_errors() {
+            let (_root, path) = path("reload-wait.sock");
+            let Instance::Primary {
+                commands,
+                _socket: _guard,
+            } = acquire_at(path.clone(), Command::Show).unwrap()
+            else {
+                panic!()
+            };
+
+            let path_ok = path.clone();
+            let client_ok = thread::spawn(move || {
+                let mut stream = UnixStream::connect(&path_ok).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream.write_all(&[RELOAD_WAIT]).unwrap();
+                let mut response = String::new();
+                stream.read_to_string(&mut response).unwrap();
+                response
+            });
+
+            let Command::ReloadAndWait(reply) =
+                commands.recv_timeout(Duration::from_secs(1)).unwrap()
+            else {
+                panic!("expected ReloadAndWait")
+            };
+            // Another command must still be serviced while reload is in flight.
+            notify(&path, Command::Show).unwrap();
+            assert_eq!(
+                commands.recv_timeout(Duration::from_secs(1)).unwrap(),
+                Command::Show
+            );
+            reply.send(Ok(()));
+            assert_eq!(client_ok.join().unwrap(), "ok\n");
+
+            let path_err = path.clone();
+            let client_err = thread::spawn(move || {
+                let mut stream = UnixStream::connect(&path_err).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream.write_all(&[RELOAD_WAIT]).unwrap();
+                let mut response = String::new();
+                stream.read_to_string(&mut response).unwrap();
+                response
+            });
+
+            let Command::ReloadAndWait(reply) =
+                commands.recv_timeout(Duration::from_secs(1)).unwrap()
+            else {
+                panic!("expected ReloadAndWait")
+            };
+            reply.send(Err("build failed\nline 2".into()));
+            assert_eq!(client_err.join().unwrap(), "err:build failed line 2\n");
         }
 
         #[test]

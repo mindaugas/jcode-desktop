@@ -166,10 +166,14 @@ fn rebuild_and_reload(
     rebuild_state: Rc<RebuildState>,
     force: bool,
     source: &'static str,
+    completion: Option<instance::ReloadReply>,
     cx: &mut App,
 ) {
     if !rebuild_state.try_start() {
         eprintln!("UI rebuild already in progress; ignoring {source} request");
+        if let Some(reply) = completion {
+            reply.send(Err("UI rebuild already in progress".into()));
+        }
         return;
     }
 
@@ -179,13 +183,21 @@ fn rebuild_and_reload(
             .spawn(async move { rebuild_ui(force) })
             .await;
         rebuild_state.finish();
-        match result {
-            Ok(()) => {
-                if let Err(error) = cx.update(|cx| manager.borrow_mut().reload(cx)) {
+        let outcome = match result {
+            Ok(()) => match cx.update(|cx| manager.borrow_mut().reload(cx)) {
+                Ok(()) => Ok(()),
+                Err(error) => {
                     eprintln!("{source} UI reload failed after rebuild: {error:#}");
+                    Err(format!("{source} UI reload failed after rebuild: {error:#}"))
                 }
+            },
+            Err(error) => {
+                eprintln!("{source} UI rebuild failed: {error:#}");
+                Err(format!("{source} UI rebuild failed: {error:#}"))
             }
-            Err(error) => eprintln!("{source} UI rebuild failed: {error:#}"),
+        };
+        if let Some(reply) = completion {
+            reply.send(outcome);
         }
     })
     .detach();
@@ -772,17 +784,34 @@ fn main() {
                     commands = receiver;
                     let Ok(command) = command else { return };
 
-                    if command == InstanceCommand::Reload {
-                        cx.update(|cx| {
-                            rebuild_and_reload(
-                                manager.clone(),
-                                rebuild_state.clone(),
-                                true,
-                                "remote",
-                                cx,
-                            );
-                        });
-                        continue;
+                    match command {
+                        InstanceCommand::Reload => {
+                            cx.update(|cx| {
+                                rebuild_and_reload(
+                                    manager.clone(),
+                                    rebuild_state.clone(),
+                                    true,
+                                    "remote",
+                                    None,
+                                    cx,
+                                );
+                            });
+                            continue;
+                        }
+                        InstanceCommand::ReloadAndWait(reply) => {
+                            cx.update(|cx| {
+                                rebuild_and_reload(
+                                    manager.clone(),
+                                    rebuild_state.clone(),
+                                    true,
+                                    "remote",
+                                    Some(reply),
+                                    cx,
+                                );
+                            });
+                            continue;
+                        }
+                        _ => {}
                     }
 
                     let result = cx.update(|cx| {
@@ -818,6 +847,7 @@ fn main() {
                     rebuild_state.clone(),
                     true,
                     "interactive",
+                    None,
                     cx,
                 );
             }
@@ -854,6 +884,7 @@ fn main() {
                     rebuild_state.clone(),
                     false,
                     "startup",
+                    None,
                     cx,
                 );
             }
