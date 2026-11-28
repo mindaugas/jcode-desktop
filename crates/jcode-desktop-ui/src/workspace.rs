@@ -4,6 +4,9 @@
 //! Panels live on one of four infinite horizontal strips. Focus moves
 //! left/right within a strip and up/down between strips.
 
+#[path = "workspace_camera_offset.rs"]
+mod camera_offset;
+
 #[path = "workspace_commands.rs"]
 mod commands;
 
@@ -4642,7 +4645,9 @@ impl Workspace {
         let mut strip = div()
             .absolute()
             .top(px(STRIP_PADDING_TOP))
-            .left(px(-camera_x))
+            // Camera motion must not invalidate Taffy's layout every frame.
+            // Translation is applied during prepaint below, like scrolling.
+            .left(px(0.))
             .w(px(strip_width + GAP * panels.len().saturating_sub(1) as f32))
             .h(px(panel_h));
 
@@ -4866,7 +4871,7 @@ impl Workspace {
                 .absolute()
                 .size_full(),
             )
-            .child(strip)
+            .child(camera_offset::camera_offset(strip, px(-camera_x)))
             // The gesture reticle: while a touchpad swipe is panning this
             // strip, a ring at the camera's focal point shows exactly where
             // focus will land when the gesture settles. It fades right after
@@ -5503,9 +5508,15 @@ impl Workspace {
                 },
             ))
             .child(if sessions {
-                crate::scrollbar::vertical_list(&self.sidebar_sessions_list, "sidebar-scrollbar")
+                crate::scrollbar::vertical_list_thin(
+                    &self.sidebar_sessions_list,
+                    "sidebar-scrollbar",
+                )
             } else {
-                crate::scrollbar::vertical_with_track(&self.sidebar_scroll, "sidebar-scrollbar")
+                crate::scrollbar::vertical_with_track_thin(
+                    &self.sidebar_scroll,
+                    "sidebar-scrollbar",
+                )
             })
             .into_any_element()
     }
@@ -11191,7 +11202,7 @@ mod tests {
             scrollbar.right() == list.right() + px(SIDEBAR_SCROLLBAR_OUTSET - 4.0),
             "the thin scrollbar sits in the gap beyond the session tabs"
         );
-        assert_eq!(scrollbar.size.width, px(3.0));
+        assert_eq!(scrollbar.size.width, px(crate::scrollbar::THIN_WIDTH));
         let gutter = vcx.debug_bounds("sidebar-scroll-gutter").unwrap();
         assert_eq!(gutter.right(), list.right() + px(SIDEBAR_SCROLLBAR_OUTSET));
         assert_eq!(gutter.size.width, px(crate::scrollbar::GUTTER));

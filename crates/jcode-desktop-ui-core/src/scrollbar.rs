@@ -9,6 +9,7 @@ use std::{cell::Cell, rc::Rc};
 use crate::theme::Theme;
 
 const WIDTH: f32 = 3.0;
+pub const THIN_WIDTH: f32 = 1.5;
 const INSET: f32 = 4.0;
 /// Space compact content can reserve for the track plus a gap on either side.
 /// Keep this stable even without overflow so rows do not shift as lists grow.
@@ -262,7 +263,12 @@ impl RenderOnce for InteractiveListScrollbar {
     }
 }
 
-fn vertical_parts(handle: &ScrollHandle, selector: &'static str, show_track: bool) -> AnyElement {
+fn vertical_parts(
+    handle: &ScrollHandle,
+    selector: &'static str,
+    show_track: bool,
+    width: f32,
+) -> AnyElement {
     let viewport_height = f32::from(handle.bounds().size.height);
     let max_offset = f32::from(handle.max_offset().y).max(0.0);
     if viewport_height <= 0.0 || max_offset <= 0.5 {
@@ -281,7 +287,7 @@ fn vertical_parts(handle: &ScrollHandle, selector: &'static str, show_track: boo
         .absolute()
         .top(px(INSET))
         .right(px(INSET))
-        .w(px(WIDTH))
+        .w(px(width))
         .h(px(track_height))
         .rounded_full()
         .when(show_track, |track| track.bg(Theme::global().MINIMAP_TRACK))
@@ -302,17 +308,21 @@ fn vertical_parts(handle: &ScrollHandle, selector: &'static str, show_track: boo
 /// The scrollable element remains responsible for wheel and touchpad input. This
 /// is deliberately an overlay, so adding it never changes transcript wrapping.
 pub fn vertical(handle: &ScrollHandle, selector: &'static str) -> AnyElement {
-    vertical_parts(handle, selector, false)
+    vertical_parts(handle, selector, false, WIDTH)
 }
 
 /// Paint a persistent track as well as the thumb, for compact regions where an
 /// isolated thumb can be mistaken for decoration.
 pub fn vertical_with_track(handle: &ScrollHandle, selector: &'static str) -> AnyElement {
-    vertical_parts(handle, selector, true)
+    vertical_parts(handle, selector, true, WIDTH)
 }
 
-/// Paint the same overlay thumb for GPUI's variable-height virtual list.
-pub fn vertical_list(state: &ListState, selector: &'static str) -> AnyElement {
+/// Hairline variant of [`vertical_with_track`] for low-prominence sidebars.
+pub fn vertical_with_track_thin(handle: &ScrollHandle, selector: &'static str) -> AnyElement {
+    vertical_parts(handle, selector, true, THIN_WIDTH)
+}
+
+fn vertical_list_with_width(state: &ListState, selector: &'static str, width: f32) -> AnyElement {
     let viewport_height = f32::from(state.viewport_bounds().size.height);
     let max_offset = f32::from(state.max_offset_for_scrollbar().y).max(0.0);
     if viewport_height <= 0.0 || max_offset <= 0.5 {
@@ -332,11 +342,21 @@ pub fn vertical_list(state: &ListState, selector: &'static str) -> AnyElement {
         .absolute()
         .top(px(thumb_top))
         .right(px(INSET))
-        .w(px(WIDTH))
+        .w(px(width))
         .h(px(thumb_height))
         .rounded_full()
         .bg(Theme::global().TEXT_FAINT)
         .into_any_element()
+}
+
+/// Paint the same overlay thumb for GPUI's variable-height virtual list.
+pub fn vertical_list(state: &ListState, selector: &'static str) -> AnyElement {
+    vertical_list_with_width(state, selector, WIDTH)
+}
+
+/// Hairline variant of [`vertical_list`] for low-prominence sidebars.
+pub fn vertical_list_thin(state: &ListState, selector: &'static str) -> AnyElement {
+    vertical_list_with_width(state, selector, THIN_WIDTH)
 }
 
 #[cfg(test)]
