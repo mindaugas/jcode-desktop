@@ -4,9 +4,6 @@
 //! Panels live on one of four infinite horizontal strips. Focus moves
 //! left/right within a strip and up/down between strips.
 
-#[path = "workspace_camera_offset.rs"]
-mod camera_offset;
-
 #[path = "workspace_commands.rs"]
 mod commands;
 
@@ -4645,9 +4642,7 @@ impl Workspace {
         let mut strip = div()
             .absolute()
             .top(px(STRIP_PADDING_TOP))
-            // Camera motion must not invalidate Taffy's layout every frame.
-            // Translation is applied during prepaint below, like scrolling.
-            .left(px(0.))
+            .left(px(-camera_x))
             .w(px(strip_width + GAP * panels.len().saturating_sub(1) as f32))
             .h(px(panel_h));
 
@@ -4871,7 +4866,7 @@ impl Workspace {
                 .absolute()
                 .size_full(),
             )
-            .child(camera_offset::camera_offset(strip, px(-camera_x)))
+            .child(strip)
             // The gesture reticle: while a touchpad swipe is panning this
             // strip, a ring at the camera's focal point shows exactly where
             // focus will land when the gesture settles. It fades right after

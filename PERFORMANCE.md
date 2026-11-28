@@ -9,7 +9,9 @@ non-comparable: use `scripts/perf-suite.py --cpu-stacks` for attribution, then
 repeat without it for timing. The profiler toggles only around the measurement
 window and flushes before terminating the isolated fixture.
 
-Two follow-up changes target that work without retaining stale scene geometry:
+Two follow-up changes were tested against that work without retaining stale
+scene geometry. The camera change below was subsequently withdrawn after the
+controlled follow-up failed to demonstrate a benefit; the engine change remains:
 
 - The horizontal strip stays at layout position zero. A transparent element
   applies the camera offset during prepaint using GPUI's normal element-offset
@@ -56,6 +58,23 @@ three composers and correct active panel. Ctrl+R rebuilt successfully in 4.34 s
 and staged generation 9, but host PID 963200 rejected it because its GPUI
 revision differs. A compatible host restart is required to activate these
 changes. No running host was killed or state reset, and no live speedup is claimed.
+
+### Controlled camera follow-up
+
+To narrow the scheduling confound, an otherwise matching legacy-camera binary
+was built from the same checkout and engine revision. Only the strip position
+and prepaint-offset wrapper differed. Three 12-second captures per binary were
+run under `taskset -c 0-3` on the private fixture/compositor, never the live host.
+Legacy/camera median draw times were 4.37/5.27 ms and animation rates were
+115.4/111.4 FPS. Candidate runs still ranged from 3.39 to 6.33 ms, so affinity did
+not eliminate variability. Artifacts are `nav-affinity-before/` and
+`nav-affinity-after/`. This is controlled diagnostic scheduling, not normal app
+behavior and not a recommendation to pin the user's application.
+
+The camera wrapper was withdrawn rather than retaining an optimization whose
+whole-app measurements were repeatedly worse or inconclusive. Normal layout
+positioning is restored. The safe engine content-bounds shortcut and parsing
+cache remain. Subsequent work targets measured scene-bounds insertion costs.
 
 ## Panel-navigation follow-up, 2026-11-28 (UTC)
 
