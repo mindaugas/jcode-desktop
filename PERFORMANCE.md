@@ -1,5 +1,61 @@
 # Interaction latency profile
 
+## Panel-navigation follow-up, 2026-11-28 (UTC)
+
+Left/right navigation was reproduced on a private GPU compositor, not by
+injecting input into the user's desktop. Moving panel bounds currently defeat
+GPUI's retained-view geometry match, so visible panel contents are prepared and
+painted again during camera animation. Reducing transcript overscan was ruled
+out: already measured offscreen rows skip element construction.
+
+The safe change in this pass is an immutable markdown syntax cache shared by
+rendering and selection preparation. It keys on exact source plus prompt
+line-break mode, retains at most 128 entries and 4 MiB of accounted allocations,
+and bypasses entries larger than 256 KiB. It does not retain GPUI elements,
+geometry, theme colors, syntax highlighting or selection IDs. Tests cover
+UTF-8 streaming prefixes, source replacement, prompt separation, eviction,
+large entries and readers surviving eviction. A test-profile parse-only
+microbenchmark (32 documents x 300 preparations) measured 1.176 s uncached
+versus 1.217 ms warm-cache. This is not an application speedup measurement.
+
+Four actual GPU navigation captures per frozen binary, in two-run alternating
+batches, used six half-width panels, the `all` transcript fixture, 77 native
+shortcut actions per capture and a private 2880x1800@120 Hz compositor:
+
+| Two-run median | Before batch 1 | Cached batch 1 | Before batch 2 | Cached batch 2 |
+| --- | ---: | ---: | ---: | ---: |
+| Animation FPS | 95.5 | 92.6 | 103.8 | 102.2 |
+| Mean draw time | 6.87 ms | 6.93 ms | 5.87 ms | 6.24 ms |
+| UI-thread CPU | 64.3% | 63.4% | 58.3% | 61.8% |
+| Input-to-frame maximum, median of runs | 42.8 ms | 43.2 ms | 47.5 ms | 43.9 ms |
+
+Artifacts: `target/perf-opt/nav-cache-{before,after}-{1,2}/`, including
+capture metadata, binary hashes and raw run metrics. The before binary is the
+previous frozen streaming-optimization candidate. Other concurrent checkout
+changes exist in the after binary, so these are not a clean single-change A/B.
+Timing variability exceeds any convincing gain: **navigation stutter is not
+fixed by this cache**, and neither an FPS improvement nor a live-host speedup
+is claimed.
+
+The hosted headless phase test agrees: before/cached p50 was 1.90/1.89 ms and
+p95 2.68/2.76 ms. Average build/prepaint/paint/layout was
+0.24/0.83/0.70/0.07 ms before and 0.25/0.85/0.70/0.07 ms after. This test uses a
+different machine and rendering backend from the GPU capture. A larger gain
+would require safely reusing moving panel rendering while preserving clips,
+hitboxes and text-selection geometry, rather than shortening the animation or
+reusing stale scene coordinates.
+
+Validation: 52 focused markdown tests and 1,963 workspace tests passed,
+18 workspace tests ignored. Two sidebar retention tests failed under parallel
+load and passed on the runner's isolated retries. The release binary built,
+and `target/perf-opt/navigation-cache-review.png` was inspected after native
+navigation on private Xvfb: tables, highlighted code, math, prompts and three
+panel composers remained visible. The state-preserving Ctrl+R rebuild succeeded
+in 47.35 s, but host PID 963200 rejected the staged generation-6 plugin because
+its `jcode-desktop-api` shared-global identity differs. Activating it requires
+a coordinated host restart. No host was killed, and the running UI remains on
+its previous code.
+
 ## Streaming-tool work reduction, 2026-11-28 (UTC)
 
 A passive 20-second capture of release host PID 963200 is saved in
