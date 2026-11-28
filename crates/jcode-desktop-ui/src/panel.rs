@@ -628,6 +628,11 @@ pub struct Panel {
 #[derive(Default)]
 struct TranscriptMeasurements {
     dirty: bool,
+    /// Earliest changed tool row. Argument deltas cannot change rows before
+    /// this point, even when the tool itself grows or activity changes below it.
+    dirty_from: Option<usize>,
+    /// Tool item indices are resolved against the next row map, after batching.
+    dirty_tool: Option<usize>,
     item_count: usize,
     row_count: usize,
     streaming_lengths: (usize, usize),
@@ -644,6 +649,7 @@ impl TranscriptMeasurements {
         streaming_lengths: (usize, usize),
         fonts: (&'static str, &'static str, &'static str),
     ) -> Option<std::ops::Range<usize>> {
+        let dirty_from = self.dirty_from.take();
         let range = if self.dirty
             || self.item_count != item_count
             || self.row_count != row_count
@@ -653,9 +659,9 @@ impl TranscriptMeasurements {
         } else if self.streaming_lengths != streaming_lengths {
             // At most reasoning, assistant text, and activity occupy the live
             // suffix. Settling/merging reasoning explicitly dirties history.
-            Some(row_count.saturating_sub(3)..row_count)
+            Some(dirty_from.unwrap_or(row_count).min(row_count.saturating_sub(3))..row_count)
         } else {
-            None
+            dirty_from.map(|start| start.min(row_count)..row_count)
         };
         self.dirty = false;
         self.item_count = item_count;
@@ -2788,13 +2794,15 @@ impl Panel {
             // New live evidence supersedes the earlier persisted candidate.
             self.reconnect_response = None;
         }
-        // Streaming appends only affect the live suffix. Keep a conservative
-        // full invalidation for tools, status transitions, images and errors.
+        // Streaming appends only affect the live suffix. Tool argument deltas
+        // invalidate from their tool row below, not the entire history. Keep a
+        // full invalidation for structure/status transitions, images and errors.
         // Metadata-only events still repaint chrome without discarding heights.
         if !matches!(
             event,
             ApiEvent::TextDelta { .. }
                 | ApiEvent::ReasoningDelta { .. }
+                | ApiEvent::ToolInputDelta { .. }
                 | ApiEvent::TokenUsage { .. }
                 | ApiEvent::ModelInfo { .. }
                 | ApiEvent::RuntimeInfo { .. }
@@ -2863,8 +2871,13 @@ impl Panel {
                 });
             }
             ApiEvent::ToolInputDelta { call_id, delta, .. } => {
-                if let Some(Item::Tool { input, .. }) = self.find_tool(call_id) {
-                    input.push_str(delta);
+                if let Some(index) = self.find_tool_index(call_id) {
+                    self.transcript_measurements.dirty_tool = Some(
+                        self.transcript_measurements.dirty_tool.unwrap_or(index).min(index),
+                    );
+                    if let Item::Tool { input, .. } = &mut self.items[index] {
+                        input.push_str(delta);
+                    }
                 }
             }
             ApiEvent::ToolDone {
@@ -3148,7 +3161,7 @@ impl Panel {
         })
     }
 
-    fn find_tool(&mut self, call_id: &str) -> Option<&mut Item> {
+    fn find_tool_index(&self, call_id: &str) -> Option<usize> {
         // The legacy harness protocol streams `tool_input` without an id. The
         // bridge preserves that fact as an empty call_id, so associate those
         // deltas with the most recent active call. Exact ids still win for
@@ -3156,13 +3169,17 @@ impl Panel {
         if call_id.is_empty() {
             return self
                 .items
-                .iter_mut()
-                .rev()
-                .find(|item| matches!(item, Item::Tool { done: false, .. }));
+                .iter()
+                .rposition(|item| matches!(item, Item::Tool { done: false, .. }));
         }
-        self.items.iter_mut().rev().find(
+        self.items.iter().rposition(
             |item| matches!(item, Item::Tool { call_id: existing, .. } if existing == call_id),
         )
+    }
+
+    fn find_tool(&mut self, call_id: &str) -> Option<&mut Item> {
+        let index = self.find_tool_index(call_id)?;
+        Some(&mut self.items[index])
     }
 
     fn insert_rendered_image(&mut self, image: jcode_sdk::RenderedImage) {
@@ -4870,6 +4887,21 @@ impl Render for Panel {
                     .splice(row_count..self.transcript_row_count, 0);
             }
             self.transcript_row_count = row_count;
+        }
+        if let Some(index) = self.transcript_measurements.dirty_tool.take() {
+            // Resolve after all pending deltas, using actual presentation rows
+            // (hidden todos, merged reasoning and applets shift their indices).
+            // Structural changes already set `dirty`, so they retain the full
+            // fallback even if an insertion has shifted the queued item index.
+            if let Some(row) = self.transcript_derived.as_ref().and_then(|derived| {
+                derived.rows.iter().position(|row| {
+                    matches!(row.source, TranscriptRowSource::Settled(i) if i == index)
+                })
+            }) {
+                self.transcript_measurements.dirty_from = Some(row);
+            } else {
+                self.transcript_measurements.dirty = true;
+            }
         }
         let theme = Theme::global();
         if let Some(range) = self.transcript_measurements.take_range(
