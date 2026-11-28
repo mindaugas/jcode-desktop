@@ -11,6 +11,7 @@ pub mod managed_cloud;
 pub mod managed_cloud_parity;
 pub mod platform;
 pub mod remote_targets;
+pub mod todo_summary;
 
 static CLIENT_VERSION: OnceLock<&'static str> = OnceLock::new();
 

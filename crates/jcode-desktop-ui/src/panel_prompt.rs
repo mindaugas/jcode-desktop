@@ -1,8 +1,7 @@
 use super::*;
 use std::{cell::Cell, rc::Rc};
 
-// The card sits below the row's inter-message gap. The sticky boundary is
-// the card top, not the row top and not the disappearance of its bottom.
+// Preserve the transcript row's inter-message spacing independently of the header.
 pub(super) const PROMPT_TOP_PADDING: f32 = 10.;
 const COLLAPSED_PROMPT_LINES: usize = 6;
 const COLLAPSED_PROMPT_MAX_HEIGHT: f32 = 140.;
@@ -85,32 +84,14 @@ pub(super) fn visibility_marker(
     .into_any_element()
 }
 
-/// Use painted row geometry, including partially clipped rows. Logical list
-/// offsets are an end sentinel during tail following and cannot identify this.
+/// The header always represents the latest genuine user turn, even before the
+/// first list paint, while browsing history, or below a tall attachment.
 fn prompt_for_viewport(
     prompt_rows: &[(usize, usize)],
-    visible: Option<VisibleRows>,
-    at_live_end: bool,
+    _visible: Option<VisibleRows>,
+    _at_live_end: bool,
 ) -> Option<usize> {
-    let visible = visible?;
-    // A freshly submitted prompt at the live end supersedes the old reminder.
-    // While browsing history, a later prompt entering the bottom must not unpin
-    // the current turn before that later card reaches the top.
-    if at_live_end
-        && prompt_rows
-            .last()
-            .is_some_and(|(row, _)| *row > visible.first && *row <= visible.last)
-    {
-        return None;
-    }
-    prompt_rows
-        .iter()
-        .rev()
-        .find(|(row, _)| {
-            *row < visible.first
-                || (*row == visible.first && visible.first_top + px(PROMPT_TOP_PADDING) <= px(0.))
-        })
-        .map(|(_, index)| *index)
+    prompt_rows.last().map(|(_, index)| *index)
 }
 
 pub(super) fn is_pinnable_prompt(item: &Item) -> bool {
@@ -198,7 +179,13 @@ impl Panel {
         let collapsed = preview.is_some() && !expanded;
         let card = div()
             .relative()
-            .debug_selector(move || format!("user-prompt-{index}").into())
+            .debug_selector(move || {
+                if pinned {
+                    format!("pinned-user-prompt-{index}")
+                } else {
+                    format!("user-prompt-{index}")
+                }
+            })
             .max_w_full()
             .min_w_0()
             .flex_shrink_1()
@@ -209,7 +196,24 @@ impl Panel {
             .text_color(Theme::global().TEXT_USER)
             .child(
                 div()
-                    .debug_selector(move || format!("prompt-content-{index}").into())
+                    .id((
+                        if pinned {
+                            "pinned-prompt-content"
+                        } else {
+                            "inline-prompt-content"
+                        },
+                        index,
+                    ))
+                    .debug_selector(move || {
+                        if pinned {
+                            format!("pinned-prompt-content-{index}")
+                        } else {
+                            format!("prompt-content-{index}")
+                        }
+                    })
+                    .when(pinned, |content| {
+                        content.max_h(px(180.)).overflow_y_scroll()
+                    })
                     // Also bound rendered markdown (headings, tables, images)
                     // and wrapping in narrow chat panes, not just source length.
                     // Clamp wrapped text to whole visual lines with an
@@ -275,7 +279,13 @@ impl Panel {
                 card.child(
                     div()
                         .id(("prompt-expand", index))
-                        .debug_selector(move || format!("prompt-expand-{index}").into())
+                        .debug_selector(move || {
+                            if pinned {
+                                format!("pinned-prompt-expand-{index}")
+                            } else {
+                                format!("prompt-expand-{index}")
+                            }
+                        })
                         .mt_1()
                         .text_size(px(11.))
                         .text_color(Theme::global().TEXT_DIM)
@@ -307,13 +317,16 @@ impl Panel {
             .items_start()
             .relative()
             .left(px(offset))
-            .when(!pinned && self.offscreen_prompt == Some(index), |row| {
-                row.invisible()
-            })
             .when_some(number, |row, number| {
                 row.gap(px(6.)).child(
                     div()
-                        .debug_selector(move || format!("prompt-number-{index}-{number}").into())
+                        .debug_selector(move || {
+                            if pinned {
+                                format!("pinned-prompt-number-{index}-{number}")
+                            } else {
+                                format!("prompt-number-{index}-{number}")
+                            }
+                        })
                         .flex_none()
                         .mt(px(4.))
                         .w(px(number_width))
@@ -332,15 +345,17 @@ impl Panel {
             .into_any_element()
     }
 
-    /// Keep the reminder out of flex layout. Inserting it above the list moves
-    /// every visible row by its height at the pin boundary, and also changes
-    /// the viewport used to decide whether the original prompt is visible.
+    /// A persistent flex header stays above the transcript. Its presence never
+    /// changes on scroll, so historical first rows remain reachable and there
+    /// is no scroll-dependent layout boundary or masked transcript content.
     pub(super) fn render_pinned_prompt(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
-        let index = self.offscreen_prompt?;
+        // Resolve synchronously: the observer describes the previous paint and
+        // must never delay a newly submitted prompt or the initial header.
+        let index = self.items.iter().rposition(is_pinnable_prompt)?;
         let item = self.items.get(index)?.clone();
         if !is_pinnable_prompt(&item) {
             return None;
@@ -353,65 +368,21 @@ impl Panel {
             div()
                 .id("pinned-latest-prompt")
                 .debug_selector(|| "pinned-latest-prompt".into())
+                .flex_none()
                 .relative()
                 .w_full()
                 .min_w_0()
-                // Mask transcript ink behind the prompt. The separate fade
-                // below starts fully opaque, avoiding the hard edge where a
-                // solid backdrop used to meet a partially transparent shadow.
+                // Match the reading surface without overlaying transcript ink.
                 .bg(background)
-                .max_h(
-                    self.offscreen_prompt_clip
-                        .map(|top| (top - px(6.)).max(px(0.)))
-                        .unwrap_or(self.transcript_list.viewport_bounds().size.height)
-                        .min(self.transcript_list.viewport_bounds().size.height),
-                )
-                .when(self.offscreen_prompt_clip.is_some(), |overlay| {
-                    // Bottom alignment moves the intact outgoing card upward
-                    // as the next one approaches, rather than cutting through
-                    // stationary text. Keep a visible gap between both cards.
-                    overlay.flex().flex_col().justify_end().overflow_hidden()
-                })
-                .when(self.offscreen_prompt_clip.is_none(), |overlay| {
-                    overlay.overflow_y_scroll()
-                })
+                // Do not cap against last frame's viewport: it is zero before
+                // initial layout and can be stale after resize. The compact
+                // source preview bounds the normal header independently.
+                .max_h(px(240.))
+                .overflow_y_scroll()
                 .occlude()
                 .px_3()
                 .text_size(px(13.5))
                 .child(self.render_user_prompt(index, text, true, window, cx))
-                .map(|prompt| {
-                    let transparent = gpui::Rgba {
-                        a: 0.,
-                        ..background
-                    };
-                    let fade_height = if self.offscreen_prompt_clip.is_some() {
-                        6.
-                    } else {
-                        18.
-                    };
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .w_full()
-                        .child(prompt)
-                        // Outside the prompt's scroll clip so the soft edge
-                        // remains visible without changing transcript layout.
-                        .child(
-                            div()
-                                .debug_selector(|| "pinned-prompt-fade".into())
-                                .absolute()
-                                .left_0()
-                                .bottom(px(-fade_height))
-                                .w_full()
-                                .h(px(fade_height))
-                                .bg(gpui::linear_gradient(
-                                    180.,
-                                    gpui::linear_color_stop(background, 0.),
-                                    gpui::linear_color_stop(transparent, 1.),
-                                )),
-                        )
-                })
                 .into_any_element(),
         )
     }
@@ -434,9 +405,8 @@ impl Panel {
                 let at_live_end =
                     following_tail || visible.is_some_and(|rows| rows.last + 1 == row_count);
                 let offscreen = prompt_for_viewport(&prompt_rows, visible, at_live_end);
-                // The next card pushes the old reminder above the viewport.
-                // Constrain only the overlay, never either card's layout.
-                let clip = offscreen.and_then(|_| visible?.next_prompt_top.map(|(_, top)| top));
+                // Historical rows cannot push the persistent latest header off.
+                let clip = None;
                 cx.defer(move |cx| {
                     // Read first: an update counts as a change for retained views.
                     let Some(entity) = panel.upgrade() else {
@@ -512,21 +482,38 @@ mod tests {
                 cx.notify();
             });
             vcx.run_until_parked();
-            let compact = vcx.debug_bounds("user-prompt-0").unwrap();
+            let compact = vcx.debug_bounds("pinned-user-prompt-0").unwrap();
             assert!(compact.size.height < px(180.));
-            let toggle = vcx.debug_bounds("prompt-expand-0").unwrap();
-            vcx.simulate_click(toggle.center(), gpui::Modifiers::default());
+            let inline_toggle = vcx.debug_bounds("prompt-expand-0").unwrap();
+            vcx.simulate_click(inline_toggle.center(), gpui::Modifiers::default());
             vcx.run_until_parked();
-            assert!(vcx.debug_bounds("user-prompt-0").unwrap().size.height > compact.size.height);
+            assert_eq!(vcx.debug_bounds("pinned-user-prompt-0").unwrap(), compact);
             panel.read_with(vcx, |panel, _| {
                 assert!(panel.expanded_prompts.contains(&(0, false)));
+                assert!(!panel.expanded_prompts.contains(&(0, true)));
+            });
+            let inline_toggle = vcx.debug_bounds("prompt-expand-0").unwrap();
+            vcx.simulate_click(inline_toggle.center(), gpui::Modifiers::default());
+            vcx.run_until_parked();
+            let toggle = vcx.debug_bounds("pinned-prompt-expand-0").unwrap();
+            vcx.simulate_click(toggle.center(), gpui::Modifiers::default());
+            vcx.run_until_parked();
+            assert!(
+                vcx.debug_bounds("pinned-user-prompt-0")
+                    .unwrap()
+                    .size
+                    .height
+                    > compact.size.height
+            );
+            panel.read_with(vcx, |panel, _| {
+                assert!(panel.expanded_prompts.contains(&(0, true)));
                 assert!(matches!(&panel.items[0], Item::User(original) if original == &text));
             });
-            let toggle = vcx.debug_bounds("prompt-expand-0").unwrap();
+            let toggle = vcx.debug_bounds("pinned-prompt-expand-0").unwrap();
             vcx.simulate_click(toggle.center(), gpui::Modifiers::default());
             vcx.run_until_parked();
             assert_eq!(
-                vcx.debug_bounds("user-prompt-0").unwrap().size,
+                vcx.debug_bounds("pinned-user-prompt-0").unwrap().size,
                 compact.size
             );
             panel.update(vcx, |panel, cx| {
@@ -540,21 +527,27 @@ mod tests {
             vcx.run_until_parked();
             assert!(vcx.debug_bounds("pinned-latest-prompt").is_some());
             assert_eq!(
-                vcx.debug_bounds("user-prompt-0").unwrap().size,
+                vcx.debug_bounds("pinned-user-prompt-0").unwrap().size,
                 compact.size
             );
-            let toggle = vcx.debug_bounds("prompt-expand-0").unwrap();
+            let toggle = vcx.debug_bounds("pinned-prompt-expand-0").unwrap();
             vcx.simulate_click(toggle.center(), gpui::Modifiers::default());
             vcx.run_until_parked();
-            assert!(vcx.debug_bounds("user-prompt-0").unwrap().size.height > compact.size.height);
+            assert!(
+                vcx.debug_bounds("pinned-user-prompt-0")
+                    .unwrap()
+                    .size
+                    .height
+                    > compact.size.height
+            );
             panel.read_with(vcx, |panel, _| {
                 assert!(panel.expanded_prompts.contains(&(0, true)))
             });
-            let toggle = vcx.debug_bounds("prompt-expand-0").unwrap();
+            let toggle = vcx.debug_bounds("pinned-prompt-expand-0").unwrap();
             vcx.simulate_click(toggle.center(), gpui::Modifiers::default());
             vcx.run_until_parked();
             assert_eq!(
-                vcx.debug_bounds("user-prompt-0").unwrap().size,
+                vcx.debug_bounds("pinned-user-prompt-0").unwrap().size,
                 compact.size
             );
         }
@@ -582,7 +575,7 @@ mod tests {
             });
             vcx.run_until_parked();
             // The clip box adds 4px of fill padding above and below the text.
-            let content = vcx.debug_bounds("prompt-content-0").unwrap();
+            let content = vcx.debug_bounds("pinned-prompt-content-0").unwrap();
             let line_height = 13.5 * 1.55;
             let lines = (f32::from(content.size.height) - 8.) / line_height;
             assert!(
@@ -591,7 +584,7 @@ mod tests {
             );
             assert!(lines.round() as usize <= COLLAPSED_PROMPT_LINES);
             // The clip box is cancelled by margins, so the card still hugs text.
-            let card = vcx.debug_bounds("user-prompt-0").unwrap();
+            let card = vcx.debug_bounds("pinned-user-prompt-0").unwrap();
             assert!(card.left() <= content.left() + px(0.5));
         }
     }
@@ -623,7 +616,7 @@ mod tests {
 
     fn assert_number_geometry(vcx: &mut gpui::VisualTestContext, card: gpui::Bounds<gpui::Pixels>) {
         let number = vcx
-            .debug_bounds("prompt-number-0-1")
+            .debug_bounds("pinned-prompt-number-0-1")
             .expect("genuine prompt is numbered");
         assert_eq!(
             card.left() - number.right(),
@@ -633,7 +626,7 @@ mod tests {
         assert_eq!(number.top(), card.top() + px(4.));
         assert_eq!(number.size, gpui::size(px(20.), px(20.)));
         assert!(number.left() >= vcx.debug_bounds("transcript").unwrap().left());
-        let content = vcx.debug_bounds("prompt-content-0").unwrap();
+        let content = vcx.debug_bounds("pinned-prompt-content-0").unwrap();
         assert!(
             number.right() < content.left(),
             "number never overlaps prompt content"
@@ -759,65 +752,24 @@ mod tests {
     }
 
     #[test]
-    fn viewport_prompt_never_comes_from_a_future_turn() {
+    fn latest_prompt_survives_initial_paint_middle_attachment_and_scroll() {
         let prompts = [(0, 0), (12, 16), (30, 40)];
-        assert_eq!(prompt_for_viewport(&prompts, None, false), None);
-        for (first, expected) in [
-            (0, None),
-            (5, Some(0)),
-            (12, Some(0)),
-            (20, Some(16)),
-            (35, Some(40)),
-        ] {
-            assert_eq!(
-                prompt_for_viewport(&prompts, visible(first, first + 5, 0.), false),
-                expected
-            );
+        assert_eq!(prompt_for_viewport(&[], None, false), None);
+        for live in [false, true] {
+            for geometry in [
+                None,
+                visible(0, 5, 0.),
+                visible(12, 30, -5.),
+                visible(30, 35, 0.),
+                visible(30, 35, -10.),
+                visible(31, 31, -1800.),
+                visible(35, 40, -5.),
+            ] {
+                assert_eq!(prompt_for_viewport(&prompts, geometry, live), Some(40));
+            }
         }
-    }
-
-    #[test]
-    fn pin_threshold_is_the_card_top_even_while_its_row_is_visible() {
-        let prompts = [(0, 0), (12, 16)];
-        for (top, expected) in [
-            (0., None),
-            (-9.99, None),
-            (-10., Some(0)),
-            (-10.01, Some(0)),
-            (-35., Some(0)),
-        ] {
-            assert_eq!(
-                prompt_for_viewport(&prompts, visible(0, 5, top), false),
-                expected
-            );
-        }
-        // The previous card survives the incoming row's ten-pixel top gap,
-        // in both directions, until the incoming card itself reaches zero.
-        for (top, expected) in [
-            (0., 0),
-            (-9.5, 0),
-            (-10., 16),
-            (-10.5, 16),
-            (-9.5, 0),
-            (0., 0),
-        ] {
-            assert_eq!(
-                prompt_for_viewport(&prompts, visible(12, 15, top), false),
-                Some(expected)
-            );
-        }
-        // A subsequent prompt down-screen does not remove historical context.
         assert_eq!(
-            prompt_for_viewport(&prompts, visible(3, 12, -5.), false),
-            Some(0)
-        );
-        // At the live end, a newly visible submitted prompt supersedes it.
-        assert_eq!(
-            prompt_for_viewport(&prompts, visible(3, 12, -5.), true),
-            None
-        );
-        assert_eq!(
-            prompt_for_viewport(&prompts, visible(12, 15, -10.), false),
+            prompt_for_viewport(&[(0, 0), (12, 16)], visible(3, 12, -5.), true),
             Some(16)
         );
     }
@@ -860,10 +812,19 @@ mod tests {
                     cx.notify();
                 });
                 vcx.run_until_parked();
-                let original = vcx.debug_bounds("user-prompt-0").unwrap();
+                let original = vcx.debug_bounds("pinned-user-prompt-0").unwrap();
                 assert_number_geometry(vcx, original);
                 let viewport = vcx.debug_bounds("transcript").unwrap();
-                assert_eq!(original.top(), viewport.top() + px(PROMPT_TOP_PADDING));
+                assert_eq!(original.bottom(), viewport.top());
+                let inline = vcx.debug_bounds("user-prompt-0").unwrap();
+                assert!(
+                    inline.top() >= viewport.top(),
+                    "first historical row is not masked by the header"
+                );
+                assert!(
+                    inline.size.height > px(0.),
+                    "original row is visible, not a blank spacer"
+                );
                 // Cross in both directions, including an exactly aligned card,
                 // fractional pixel offsets, and a still mostly visible row.
                 for offset in [9.5, 10., 10.5, 15., 10., 9.5, 0.] {
@@ -876,7 +837,7 @@ mod tests {
                     });
                     vcx.run_until_parked();
                     let card = vcx
-                        .debug_bounds("user-prompt-0")
+                        .debug_bounds("pinned-user-prompt-0")
                         .expect("card never disappears");
                     assert_number_geometry(vcx, card);
                     assert_eq!(
@@ -886,14 +847,11 @@ mod tests {
                     assert_eq!(card.left(), original.left(), "no horizontal jump");
                     assert_eq!(
                         card.top(),
-                        (original.top() - px(offset)).max(viewport.top()),
-                        "card clamps exactly to transcript top"
+                        original.top(),
+                        "latest card stays above transcript"
                     );
                     assert_eq!(vcx.debug_bounds("transcript").unwrap(), viewport);
-                    assert_eq!(
-                        vcx.debug_bounds("pinned-latest-prompt").is_some(),
-                        offset >= PROMPT_TOP_PADDING
-                    );
+                    assert_eq!(vcx.debug_bounds("pinned-latest-prompt").is_some(), true);
                     if let Some(pinned) = vcx.debug_bounds("pinned-latest-prompt") {
                         assert_eq!(pinned.top(), card.top(), "no banner padding above the card");
                         assert_eq!(
@@ -934,7 +892,9 @@ mod tests {
                     cx.notify();
                 });
                 vcx.run_until_parked();
-                let card = vcx.debug_bounds("user-prompt-0").expect("prompt paints");
+                let card = vcx
+                    .debug_bounds("pinned-user-prompt-0")
+                    .expect("prompt paints");
                 assert_number_geometry(vcx, card);
                 let viewport = vcx.debug_bounds("transcript").unwrap();
                 assert!(card.left() >= viewport.left());
@@ -959,7 +919,7 @@ mod tests {
     fn multi_digit_prompt_numbers_stay_in_left_badges(cx: &mut gpui::TestAppContext) {
         let (panel, vcx) = cx.add_window_view(|_, cx| {
             Panel::new(
-                "prompt-number-gutter".into(),
+                "pinned-prompt-number-gutter".into(),
                 None,
                 None,
                 crate::harness::spawn_inert(),
@@ -976,15 +936,15 @@ mod tests {
                 for (count, card_selector, content_selector, number_selector) in [
                     (
                         99,
-                        "user-prompt-98",
-                        "prompt-content-98",
-                        "prompt-number-98-99",
+                        "pinned-user-prompt-98",
+                        "pinned-prompt-content-98",
+                        "pinned-prompt-number-98-99",
                     ),
                     (
                         100,
-                        "user-prompt-99",
-                        "prompt-content-99",
-                        "prompt-number-99-100",
+                        "pinned-user-prompt-99",
+                        "pinned-prompt-content-99",
+                        "pinned-prompt-number-99-100",
                     ),
                 ] {
                     panel.update(vcx, |panel, cx| {
@@ -1019,130 +979,84 @@ mod tests {
     }
 
     #[gpui::test]
-    fn newer_prompt_pushes_old_sticky_card_without_overlap(cx: &mut gpui::TestAppContext) {
-        let (panel, vcx) = cx.add_window_view(|_, cx| {
-            Panel::new(
-                "prompt-stack".into(),
+    fn initial_header_and_tall_attachment_never_leave_a_gap(cx: &mut gpui::TestAppContext) {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(64, 2048, image::Rgba([240, 20, 60, 255]))
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let image = TranscriptImage::from_rendered(jcode_sdk::RenderedImage {
+            history_message_index: None,
+            media_type: "image/png".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes.into_inner()),
+            label: Some("Tall attachment".into()),
+            source: jcode_sdk::RenderedImageSource::UserInput,
+            anchor: None,
+        });
+        let (panel, vcx) = cx.add_window_view(|window, cx| {
+            let mut panel = Panel::new(
+                "attachment-header".into(),
                 None,
                 None,
                 crate::harness::spawn_inert(),
                 cx,
-            )
+            );
+            *panel.items = vec![
+                Item::User("Earlier prompt".into()),
+                Item::Image(image),
+                Item::User("Latest prompt below the attachment".into()),
+                Item::Assistant("Answer".into()),
+            ];
+            assert_eq!(panel.offscreen_prompt, None);
+            assert_eq!(panel.transcript_list.viewport_bounds().size.height, px(0.));
+            assert!(
+                panel.render_pinned_prompt(window, cx).is_some(),
+                "initial render needs no visibility observation"
+            );
+            panel
         });
         let handle = vcx.update(|window, _| window.window_handle());
-        vcx.simulate_window_resize(handle, gpui::size(px(600.), px(600.)));
+        vcx.simulate_window_resize(handle, gpui::size(px(600.), px(500.)));
+        for row in [0, 1, 2, 0] {
+            panel.update(vcx, |panel, cx| {
+                panel.stick_to_bottom = false;
+                panel.transcript_list.scroll_to(gpui::ListOffset {
+                    item_ix: row,
+                    offset_in_item: px(0.),
+                });
+                // Reproduce stale observer data that previously clipped the
+                // complete header when another prompt entered the viewport.
+                panel.offscreen_prompt_clip = Some(px(0.));
+                cx.notify();
+            });
+            vcx.run_until_parked();
+            let header = vcx.debug_bounds("pinned-latest-prompt").unwrap();
+            assert_eq!(
+                header.bottom(),
+                vcx.debug_bounds("transcript").unwrap().top()
+            );
+            assert!(header.size.height > px(0.) && header.size.height < px(100.));
+            let card = vcx.debug_bounds("pinned-user-prompt-2").unwrap();
+            assert_eq!(card.top(), header.top());
+            assert!(card.bottom() <= header.bottom());
+            panel.read_with(vcx, |panel, _| assert_eq!(panel.offscreen_prompt, Some(2)));
+        }
         panel.update(vcx, |panel, cx| {
-            *panel.items = vec![
-                Item::User("Old prompt line\n\n".repeat(5)),
-                Item::Assistant("Short answer".into()),
-                Item::User("Newer prompt line\n\n".repeat(3)),
-            ];
-            for n in 0..40 {
-                panel.items.push(Item::Assistant(format!("Response {n}")));
-            }
+            panel.items.push(Item::User("Just submitted".into()));
+            panel.offscreen_prompt = Some(0);
             cx.notify();
         });
         vcx.run_until_parked();
-        panel.update(vcx, |panel, cx| {
-            panel.stick_to_bottom = false;
-            panel.transcript_list.scroll_to(gpui::ListOffset::default());
-            cx.notify();
-        });
-        vcx.run_until_parked();
-        let old_size = vcx.debug_bounds("user-prompt-0").unwrap().size;
-        let new_size = vcx.debug_bounds("user-prompt-2").unwrap().size;
-        let mut pushed_off = false;
-        let mut switched = false;
-        for _ in 0..150 {
-            let viewport = vcx.debug_bounds("transcript").unwrap();
-            vcx.simulate_event(gpui::ScrollWheelEvent {
-                position: viewport.center(),
-                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-6.))),
-                modifiers: Default::default(),
-                touch_phase: gpui::TouchPhase::Moved,
-            });
-            vcx.run_until_parked();
-            scroll_momentum_tests::settle(vcx);
-            let pinned_index = panel.read_with(vcx, |panel, _| panel.offscreen_prompt);
-            if pushed_off {
-                assert!(
-                    pinned_index.is_some(),
-                    "no missing reminder at the incoming row padding"
-                );
-            }
-            if pinned_index == Some(0) {
-                let old = vcx.debug_bounds("user-prompt-0").unwrap();
-                let newer = vcx.debug_bounds("user-prompt-2").unwrap();
-                assert_eq!(old.size, old_size, "clipping never resizes old content");
-                assert_eq!(newer.size, new_size);
-                assert!(old.bottom() <= newer.top(), "prompt cards never overlap");
-                if old.top() < viewport.top() {
-                    pushed_off = true;
-                    let overlay = vcx.debug_bounds("pinned-latest-prompt").unwrap();
-                    assert_eq!(
-                        overlay.bottom(),
-                        (newer.top() - px(6.)).max(viewport.top()),
-                        "outgoing card keeps a gap before the incoming card"
-                    );
-                    assert!(
-                        newer.top() > viewport.top(),
-                        "old stays pinned until newer reaches top"
-                    );
-                }
-            } else if pinned_index == Some(2) {
-                assert!(
-                    pushed_off,
-                    "incoming prompt pushes the old card upward before switching"
-                );
-                let newer = vcx.debug_bounds("user-prompt-2").unwrap();
-                assert_eq!(newer.top(), viewport.top());
-                assert_eq!(newer.size, new_size);
-                switched = true;
-                break;
-            }
-        }
-        assert!(
-            pushed_off && switched,
-            "native scroll exercises push-off and handoff"
-        );
-        let mut restored = false;
-        for _ in 0..100 {
-            let viewport = vcx.debug_bounds("transcript").unwrap();
-            vcx.simulate_event(gpui::ScrollWheelEvent {
-                position: viewport.center(),
-                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(6.))),
-                modifiers: Default::default(),
-                touch_phase: gpui::TouchPhase::Moved,
-            });
-            vcx.run_until_parked();
-            scroll_momentum_tests::settle(vcx);
-            if panel.read_with(vcx, |panel, _| panel.offscreen_prompt) == Some(0) {
-                let old = vcx.debug_bounds("user-prompt-0").unwrap();
-                let newer = vcx.debug_bounds("user-prompt-2").unwrap();
-                assert_eq!(old.size, old_size);
-                assert_eq!(newer.size, new_size);
-                assert!(newer.top() > viewport.top());
-                assert!(old.top() < viewport.top());
-                assert!(old.bottom() <= newer.top(), "reverse scroll never overlaps");
-                assert_eq!(
-                    vcx.debug_bounds("pinned-latest-prompt").unwrap().bottom(),
-                    (newer.top() - px(6.)).max(viewport.top())
-                );
-                restored = true;
-                break;
-            }
-        }
-        assert!(
-            restored,
-            "reverse native scroll restores the pushed-off card without overlap"
+        assert_eq!(
+            vcx.debug_bounds("pinned-user-prompt-4").unwrap().top(),
+            vcx.debug_bounds("pinned-latest-prompt").unwrap().top()
         );
     }
 
     #[gpui::test]
-    fn native_scroll_paints_historical_prompt_cards(cx: &mut gpui::TestAppContext) {
+    fn latest_header_survives_native_scroll_and_new_prompt(cx: &mut gpui::TestAppContext) {
         let (panel, vcx) = cx.add_window_view(|_, cx| {
             Panel::new(
-                "native-prompt-acceptance".into(),
+                "persistent-latest".into(),
                 None,
                 None,
                 crate::harness::spawn_inert(),
@@ -1152,122 +1066,55 @@ mod tests {
         let handle = vcx.update(|window, _| window.window_handle());
         vcx.simulate_window_resize(handle, gpui::size(px(600.), px(500.)));
         panel.update(vcx, |panel, cx| {
-            for number in 1..=13 {
-                panel
-                    .items
-                    .push(Item::User(format!("Distinct prompt {number}")));
-                for line in 0..40 {
-                    panel.items.push(Item::Assistant(format!(
-                        "Answer {number}, paragraph {line}"
-                    )));
+            for turn in 0..3 {
+                panel.items.push(Item::User(format!("Prompt {turn}")));
+                for n in 0..40 {
+                    panel.items.push(Item::Assistant(format!("Response {n}")));
                 }
             }
             cx.notify();
         });
         vcx.run_until_parked();
-        let pinned = vcx
-            .debug_bounds("pinned-latest-prompt")
-            .expect("tail prompt paints");
-        let caption = vcx
-            .debug_bounds("user-prompt-492")
-            .expect("prompt card paints");
-        assert!(caption.top() >= pinned.top() && caption.bottom() <= pinned.bottom());
-        println!("ACCEPTANCE: live-end pinned card paints prompt 13");
-
-        // Enter through the actual scroll event handler, not ListState mutation.
-        let mut found_historical = false;
-        for _ in 0..80 {
-            let position = vcx.debug_bounds("transcript").unwrap().center();
+        let viewport = vcx.debug_bounds("transcript").unwrap();
+        let header = vcx.debug_bounds("pinned-latest-prompt").unwrap();
+        assert!(header.size.height > px(0.));
+        for delta in [180., 2400., 2400., -180., -2400.] {
             vcx.simulate_event(gpui::ScrollWheelEvent {
-                position,
-                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(180.))),
-                modifiers: gpui::Modifiers::default(),
+                position: viewport.center(),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(delta))),
+                modifiers: Default::default(),
                 touch_phase: gpui::TouchPhase::Moved,
             });
             vcx.run_until_parked();
             scroll_momentum_tests::settle(vcx);
-            if let (Some(pinned), Some(caption)) = (
-                vcx.debug_bounds("pinned-latest-prompt"),
-                vcx.debug_bounds("user-prompt-451"),
-            ) {
-                // While the next card pushes this one out it is deliberately
-                // shifted up and clipped. Judge only settled, unclipped frames.
-                if panel.read_with(vcx, |p, _| p.offscreen_prompt_clip.is_some()) {
-                    continue;
-                }
-                assert!(
-                    caption.top() >= pinned.top() && caption.bottom() <= pinned.bottom(),
-                    "caption {caption:?} pinned {pinned:?}"
-                );
-                panel.read_with(vcx, |panel, _| {
-                    assert_eq!(
-                        panel.offscreen_prompt,
-                        Some(451),
-                        "newest prompt must not replace historical context"
-                    );
-                });
-                if let Some(newer) = vcx.debug_bounds("user-prompt-492") {
-                    assert!(
-                        newer.top() > pinned.bottom(),
-                        "a newer inline prompt can enter below the historical sticky card"
-                    );
-                }
-                found_historical = true;
-                break;
-            }
+            assert_eq!(vcx.debug_bounds("pinned-latest-prompt").unwrap(), header);
+            assert_eq!(
+                vcx.debug_bounds("pinned-user-prompt-82").unwrap().top(),
+                header.top()
+            );
+            assert_eq!(vcx.debug_bounds("transcript").unwrap(), viewport);
+            panel.read_with(vcx, |panel, _| {
+                assert_eq!(panel.offscreen_prompt, Some(82));
+                assert_eq!(panel.offscreen_prompt_clip, None);
+            });
         }
-        assert!(
-            found_historical,
-            "native upward scrolling must paint the twelfth prompt"
-        );
-        println!("ACCEPTANCE: native upward scrolling replaces pinned prompt 13 with prompt 12");
         panel.update(vcx, |panel, cx| {
-            assert!(!panel.stick_to_bottom);
-            panel
-                .items
-                .push(Item::User("A newer prompt arrives".into()));
+            panel.stick_to_bottom = false;
+            panel.items.push(Item::User("Newest prompt".into()));
             cx.notify();
         });
         vcx.run_until_parked();
-        assert!(vcx.debug_bounds("user-prompt-451").is_some());
-        assert!(vcx.debug_bounds("user-prompt-533").is_none());
-        println!("ACCEPTANCE: arrival of prompt 14 leaves viewed prompt 12 pinned");
-        // Travel to each end through the real wheel handler. Only the end
-        // state is asserted, so long strokes cover 500+ rows in a few steps
-        // instead of hundreds of small, separately settled ones.
-        for (delta, label) in [(2400., "user-prompt-0"), (-2400., "user-prompt-533")] {
-            for _ in 0..250 {
-                let position = vcx.debug_bounds("transcript").unwrap().center();
-                vcx.simulate_event(gpui::ScrollWheelEvent {
-                    position,
-                    delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(delta))),
-                    modifiers: gpui::Modifiers::default(),
-                    touch_phase: gpui::TouchPhase::Moved,
-                });
-                vcx.run_until_parked();
-                scroll_momentum_tests::settle(vcx);
-                if vcx.debug_bounds(label).is_some()
-                    && vcx.debug_bounds("pinned-latest-prompt").is_none()
-                {
-                    break;
-                }
-            }
-            assert!(
-                vcx.debug_bounds(label).is_some(),
-                "transcript card {label} paints"
-            );
-            assert!(
-                vcx.debug_bounds("pinned-latest-prompt").is_none(),
-                "visible user card must not be duplicated"
-            );
-        }
-        println!(
-            "ACCEPTANCE: native top/bottom scrolling paints prompt 1 and prompt 14 without duplicate pinned cards"
+        assert_eq!(
+            vcx.debug_bounds("pinned-user-prompt-123").unwrap().top(),
+            header.top()
         );
+        panel.read_with(vcx, |panel, _| {
+            assert_eq!(panel.offscreen_prompt, Some(123))
+        });
     }
 
     #[gpui::test]
-    fn scrolling_history_pins_the_historical_turn(cx: &mut gpui::TestAppContext) {
+    fn scrolling_history_keeps_latest_turn(cx: &mut gpui::TestAppContext) {
         let (panel, vcx) = cx.add_window_view(|_, cx| {
             Panel::new(
                 "historical-prompts".into(),
@@ -1290,7 +1137,7 @@ mod tests {
         });
         vcx.run_until_parked();
         panel.update(vcx, |panel, _| assert_eq!(panel.offscreen_prompt, Some(82)));
-        for (row, expected) in [(50, Some(41)), (10, Some(0)), (0, None)] {
+        for (row, expected) in [(50, Some(82)), (10, Some(82)), (0, Some(82))] {
             panel.update(vcx, |panel, cx| {
                 panel.stick_to_bottom = false;
                 panel.transcript_list.scroll_to(gpui::ListOffset {
@@ -1334,9 +1181,9 @@ mod tests {
         });
         vcx.run_until_parked();
         let viewport = vcx.debug_bounds("transcript").unwrap();
-        assert!(vcx.debug_bounds("pinned-latest-prompt").is_none());
+        assert!(vcx.debug_bounds("pinned-latest-prompt").is_some());
 
-        for (delta, expected_pin) in [(-4., true), (4., false)] {
+        for (delta, expected_pin) in [(-4., true), (4., true)] {
             let mut crossed = false;
             for _ in 0..80 {
                 let before = vcx.debug_bounds("transcript-row-1").unwrap().top();
@@ -1392,7 +1239,7 @@ mod tests {
             cx.notify();
         });
         vcx.run_until_parked();
-        assert!(vcx.debug_bounds("pinned-latest-prompt").is_none());
+        assert!(vcx.debug_bounds("pinned-latest-prompt").is_some());
 
         // With no todos, a long response still pins the offscreen prompt.
         panel.update(vcx, |panel, cx| {
@@ -1431,7 +1278,7 @@ mod tests {
             cx.notify();
         });
         vcx.run_until_parked();
-        assert!(vcx.debug_bounds("pinned-latest-prompt").is_none());
+        assert!(vcx.debug_bounds("pinned-latest-prompt").is_some());
     }
 
     #[gpui::test]
@@ -1468,16 +1315,12 @@ mod tests {
             px(8.),
             "todo breathing room belongs above the whole viewport"
         );
-        assert_eq!(prompt.top(), transcript.top());
+        assert_eq!(prompt.bottom(), transcript.top());
         assert!(prompt.bottom() < transcript.bottom());
-        let fade = vcx.debug_bounds("pinned-prompt-fade").unwrap();
-        assert_eq!(
-            fade.top(),
-            prompt.bottom(),
-            "fade must meet the opaque backdrop without a seam"
+        assert!(
+            vcx.debug_bounds("pinned-prompt-fade").is_none(),
+            "no overlay masks transcript content"
         );
-        assert_eq!(fade.size.width, prompt.size.width);
-        assert_eq!(fade.size.height, px(18.));
 
         // Workspace selection, not keyboard focus, chooses the reading surface.
         // Switching it must invalidate cached rendering without moving the card.
@@ -1486,7 +1329,7 @@ mod tests {
             vcx.run_until_parked();
             panel.update(vcx, |panel, _| assert_eq!(panel.surface_focused, focused));
             assert_eq!(vcx.debug_bounds("pinned-latest-prompt").unwrap(), prompt);
-            assert_eq!(vcx.debug_bounds("pinned-prompt-fade").unwrap(), fade);
+            assert!(vcx.debug_bounds("pinned-prompt-fade").is_none());
         }
 
         panel.update(vcx, |_, cx| cx.notify());
@@ -1498,11 +1341,14 @@ mod tests {
             px(8.),
             "expanded todo has the same gap"
         );
-        assert_eq!(prompt.top(), vcx.debug_bounds("transcript").unwrap().top());
+        assert_eq!(
+            prompt.bottom(),
+            vcx.debug_bounds("transcript").unwrap().top()
+        );
 
         vcx.simulate_window_resize(handle, gpui::size(px(600.), px(1600.)));
         vcx.run_until_parked();
-        assert!(vcx.debug_bounds("pinned-latest-prompt").is_none());
+        assert!(vcx.debug_bounds("pinned-latest-prompt").is_some());
         assert!(vcx.debug_bounds("pinned-todo-card").is_some());
         assert!(vcx.debug_bounds("pinned-prompt-fade").is_none());
         panel.update(vcx, |panel, cx| {
@@ -1514,6 +1360,9 @@ mod tests {
         assert!(vcx.debug_bounds("pinned-todo-card").is_none());
         let prompt = vcx.debug_bounds("pinned-latest-prompt").unwrap();
         assert_eq!(prompt.top(), px(8.), "no-todo prompt keeps a top gap");
-        assert_eq!(prompt.top(), vcx.debug_bounds("transcript").unwrap().top());
+        assert_eq!(
+            prompt.bottom(),
+            vcx.debug_bounds("transcript").unwrap().top()
+        );
     }
 }

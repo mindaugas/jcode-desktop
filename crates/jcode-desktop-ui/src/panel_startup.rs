@@ -94,8 +94,23 @@ impl Panel {
                 let Some(input) = input.get() else { return };
                 let Some(body) = body.get() else { return };
                 let viewport = list.viewport_bounds();
-                let measured_content =
-                    f32::from(viewport.size.height + list.max_offset_for_scrollbar().y);
+                // When the last row is visible, measure actual content rather
+                // than treating unused viewport space as transcript content.
+                // Pinned chrome can consume some of that space on submission.
+                let measured_content = list
+                    .item_count()
+                    .checked_sub(1)
+                    .and_then(|index| list.bounds_for_item(index))
+                    .map(|last| {
+                        f32::from(
+                            last.bottom() - viewport.top()
+                                - list.scroll_px_offset_for_scrollbar().y,
+                        )
+                        .max(0.)
+                    })
+                    .unwrap_or_else(|| {
+                        f32::from(viewport.size.height + list.max_offset_for_scrollbar().y)
+                    });
                 cx.defer(move |cx| {
                     // Work out the new layout from a read, and update only when it
                     // differs: an update counts as a change for retained views.

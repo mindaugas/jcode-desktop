@@ -5212,6 +5212,8 @@ impl Render for Panel {
             && !self.tail_gliding()
             && !startup_growing;
 
+        let pinned_prompt = self.render_pinned_prompt(window, cx);
+        let has_pinned_prompt = pinned_prompt.is_some();
         let chat = div()
             .flex()
             .flex_col()
@@ -5336,12 +5338,19 @@ impl Render for Panel {
                         cx,
                     ))
             }))
+            .children(pinned_prompt.map(|prompt| {
+                div()
+                    .flex_none()
+                    .w_full()
+                    .when(!has_pinned_todo, |header| header.mt_2())
+                    .child(prompt)
+            }))
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
                     .relative()
-                    .when(!has_pinned_todo, |body| body.mt_2())
+                    .when(!has_pinned_todo && !has_pinned_prompt, |body| body.mt_2())
                     // Pace both wheel and touchpad movement on display frames.
                     // Precise deltas use a much shorter smoothing window so
                     // native gesture control stays responsive.
@@ -5407,7 +5416,6 @@ impl Render for Panel {
                         .size_full(),
                     )
                     .child(transcript)
-                    .children(self.render_pinned_prompt(window, cx))
                     .when(docked_composer, |el| {
                         el.child(self.render_composer_dock(input_bounds.clone(), window, cx))
                     })
@@ -6381,7 +6389,9 @@ fn render_todo_card_with_style(
                         ),
                 );
             }
-            if let Some(goal) = todo_goal_for_group(&payload.goals, group) {
+            if !pinned
+                && let Some(goal) = todo_goal_for_group(&payload.goals, group)
+            {
                 section = section.child(render_todo_gate_row(goal));
             }
             for (todo_index, todo) in todos.into_iter().enumerate() {
@@ -6501,6 +6511,11 @@ fn render_todo_card_with_style(
                                 format!("{completed}/{active}")
                             }),
                     ),
+            )
+            .children(
+                jcode_desktop_harness::todo_summary::aggregate(&payload.goals)
+                    .as_ref()
+                    .map(render_todo_gate_row),
             )
             .child(body)
             .into_any_element();
@@ -9715,10 +9730,10 @@ Goals:
         let pinned = vcx
             .debug_bounds("pinned-todo-card")
             .expect("todo card should be pinned outside the transcript");
-        assert!(
-            vcx.debug_bounds("pinned-latest-prompt").is_none(),
-            "a visible transcript prompt must not be duplicated above the todo card"
-        );
+        let prompt = vcx
+            .debug_bounds("pinned-latest-prompt")
+            .expect("latest prompt stays visible below the todo card");
+        assert!(pinned.bottom() <= prompt.top());
         let transcript = vcx.debug_bounds("transcript").expect("transcript paints");
         assert!(pinned.bottom() <= transcript.top());
         assert!(vcx.debug_bounds("tool-inline").is_none());
@@ -10133,18 +10148,36 @@ fn demo_item_fixtures() -> Vec<Item> {
                 user_intention: Some("See current work without losing transcript space".into()),
                 understands_user_intent: Some(jcode_base::todo::IntentUnderstanding::Clear),
             },
-            goals: vec![jcode_base::todo::TodoGoal {
-                group: Some("Desktop".into()),
-                closed_feedback_loop: Some(jcode_base::todo::FeedbackLoopState::Usable),
-                feedback_loop_relevance: Some(
-                    jcode_base::todo::FeedbackLoopRelevance::Representative,
-                ),
-                feedback_loop_coverage: Some(jcode_base::todo::FeedbackLoopCoverage::MainPaths),
-                feedback_loop_traceability: Some(
-                    jcode_base::todo::FeedbackLoopTraceability::Partial,
-                ),
-                ..Default::default()
-            }],
+            goals: vec![
+                jcode_base::todo::TodoGoal {
+                    group: Some("Desktop".into()),
+                    closed_feedback_loop: Some(jcode_base::todo::FeedbackLoopState::Usable),
+                    feedback_loop_relevance: Some(
+                        jcode_base::todo::FeedbackLoopRelevance::Representative,
+                    ),
+                    feedback_loop_coverage: Some(jcode_base::todo::FeedbackLoopCoverage::MainPaths),
+                    feedback_loop_traceability: Some(
+                        jcode_base::todo::FeedbackLoopTraceability::Partial,
+                    ),
+                    delivery_state: Some(jcode_base::todo::DeliveryState::ChangeMade),
+                    ..Default::default()
+                },
+                jcode_base::todo::TodoGoal {
+                    group: Some("Validation".into()),
+                    closed_feedback_loop: Some(jcode_base::todo::FeedbackLoopState::Closed),
+                    feedback_loop_relevance: Some(
+                        jcode_base::todo::FeedbackLoopRelevance::AcceptanceAligned,
+                    ),
+                    feedback_loop_coverage: Some(
+                        jcode_base::todo::FeedbackLoopCoverage::EdgeAndIntegrationPaths,
+                    ),
+                    feedback_loop_traceability: Some(
+                        jcode_base::todo::FeedbackLoopTraceability::Complete,
+                    ),
+                    delivery_state: Some(jcode_base::todo::DeliveryState::OutcomeDelivered),
+                    ..Default::default()
+                },
+            ],
         }),
         Item::Assistant(
             "# Heading one\n## Heading two\n\nA paragraph with *italic*, **bold**, `inline code`, and math $e^{i\\pi}+1=0$ plus \\(n \\to \\infty\\).\n\n- top level\n  - nested item\n- [x] finished task\n- [ ] pending task\n\n1. first\n2. second\n\n> A quote line\n> continued here\n\n| block | supported |\n| --- | --- |\n| tables | yes |\n| code | yes |\n\n```rust\nfn main() {\n    // a comment\n    let name = \"world\";\n    println!(\"hello {name}\");\n}\n```\n\n$$\n\\sum_{i=0}^{n} i^2\n$$\n\n\\[ E = mc^2 \\]\n\n---\n\nDone."
