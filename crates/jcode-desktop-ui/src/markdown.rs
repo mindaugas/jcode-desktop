@@ -1237,11 +1237,6 @@ fn styled_line_layout(
             })
             .into_any_element()
     };
-    let child = crate::markdown_inline_code::wrap(
-        child,
-        layout.clone(),
-        inline.code_ranges.iter().cloned().map(shift).collect(),
-    );
     let selectable = text_selection::selectable_with_prefix(
         selection.clone(),
         key,
@@ -1250,6 +1245,11 @@ fn styled_line_layout(
         child,
         prefix.len(),
         cx,
+    );
+    let selectable = crate::markdown_inline_code::wrap(
+        selectable,
+        layout.clone(),
+        inline.code_ranges.iter().cloned().map(shift).collect(),
     );
     // The selectable leaf already establishes a relative containing block.
     // Only an avatar needs another one for its absolutely positioned overlay.
