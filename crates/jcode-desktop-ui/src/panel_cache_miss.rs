@@ -12,6 +12,10 @@ pub struct CacheMissNotice {
     pub(super) harness_caused: bool,
     pub(super) documented_cause: Option<String>,
     pub(super) missed_tokens: u64,
+    #[serde(default)]
+    pub(super) expected_tokens: u64,
+    #[serde(default)]
+    pub(super) read_tokens: u64,
     pub(super) message: String,
 }
 
@@ -21,6 +25,8 @@ impl CacheMissNotice {
             reason,
             harness_caused,
             missed_tokens,
+            expected_tokens,
+            read_tokens,
             documented_cause,
             message,
             ..
@@ -33,6 +39,8 @@ impl CacheMissNotice {
             harness_caused: *harness_caused,
             documented_cause: documented_cause.clone(),
             missed_tokens: *missed_tokens,
+            expected_tokens: *expected_tokens,
+            read_tokens: *read_tokens,
             message: message.clone(),
         })
     }
@@ -42,9 +50,76 @@ impl CacheMissNotice {
         self.harness_caused && self.documented_cause.is_none()
     }
 
-    pub(super) fn text(&self) -> String {
-        self.message.clone()
+    fn is_refresh(&self) -> bool {
+        self.message.contains("KV cache refresh")
     }
+
+    /// Compact lead label matching Jcode TUI (`2.05K KV cache miss`).
+    pub(super) fn label(&self) -> String {
+        let kind = if self.is_refresh() {
+            "KV cache refresh"
+        } else {
+            "KV cache miss"
+        };
+        if self.missed_tokens > 0 {
+            format!("{} {kind}", format_kv_tokens(self.missed_tokens))
+        } else {
+            kind.to_string()
+        }
+    }
+
+    /// Supporting evidence (` · low read · prefix unchanged · 98% hit`).
+    pub(super) fn details(&self) -> String {
+        let mut parts = Vec::new();
+        let reason = self.reason.trim().replace('_', " ");
+        if !reason.is_empty() {
+            parts.push(reason);
+        }
+        if self.message.contains("[prefix unchanged]") {
+            parts.push("prefix unchanged".to_string());
+        }
+        if self.expected_tokens > 0 {
+            let pct = ((self.read_tokens as f64 / self.expected_tokens as f64) * 100.0)
+                .round()
+                .clamp(0.0, 100.0);
+            parts.push(format!("{pct:.0}% hit"));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", parts.join(" · "))
+        }
+    }
+
+    pub(super) fn text(&self) -> String {
+        format!("{}{}", self.label(), self.details())
+    }
+}
+
+fn format_kv_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        trim_decimal(format!("{:.1}", tokens as f64 / 1e6)) + "M"
+    } else if tokens >= 100_000 {
+        format!("{}K", (tokens as f64 / 1e3).round() as u64)
+    } else if tokens >= 10_000 {
+        trim_decimal(format!("{:.1}", tokens as f64 / 1e3)) + "K"
+    } else if tokens >= 1_000 {
+        trim_decimal(format!("{:.2}", tokens as f64 / 1e3)) + "K"
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn trim_decimal(mut s: String) -> String {
+    if s.contains('.') {
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+    }
+    s
 }
 
 impl Panel {
@@ -56,43 +131,37 @@ impl Panel {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = Theme::global();
-        let tone = if notice.alarming() {
+        let label_color = if notice.is_refresh() {
+            theme.TEXT_DIM
+        } else if notice.missed_tokens >= 50_000 {
+            theme.ERROR
+        } else if notice.missed_tokens >= 10_000 || notice.alarming() {
             theme.WARN
         } else {
             theme.TEXT_DIM
         };
+        let details = notice.details();
         div()
             .debug_selector(|| "kv-cache-miss-notice".into())
             .flex()
             .items_center()
-            .map(|el| {
-                if crate::config::display().compact_notifications {
-                    el.gap_1().px_2().py_1()
-                } else {
-                    el.gap_2().px_3().py_2()
-                }
-            })
-            .rounded_full()
-            .bg(theme.HEADER_BG)
+            .min_w_0()
+            .px_1()
+            .py(px(1.))
             .text_size(px(11.))
-            .text_color(tone)
-            .child(
-                div()
-                    .flex_none()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(if notice.alarming() {
-                        "⚠ Cache bust"
-                    } else {
-                        "Cache miss"
-                    }),
-            )
-            .child(div().min_w_0().flex_1().child(text_selection::plain(
-                self.transcript_selection.clone(),
-                format!("{index}-kv-cache-miss"),
-                notice.text(),
-                window,
-                cx,
-            )))
+            .text_color(theme.TEXT_DIM)
+            .child(div().flex_none().text_color(label_color).child(notice.label()))
+            .when(!details.is_empty(), |el| {
+                el.child(div().min_w_0().flex_1().truncate().child(
+                    text_selection::plain(
+                        self.transcript_selection.clone(),
+                        format!("{index}-kv-cache-miss"),
+                        details,
+                        window,
+                        cx,
+                    ),
+                ))
+            })
             .into_any_element()
     }
 }
@@ -122,6 +191,27 @@ mod tests {
         assert!(!documented.alarming());
         let expired = CacheMissNotice::from_event(&miss(false, None)).unwrap();
         assert!(!expired.alarming());
+    }
+
+    #[test]
+    fn formats_compact_tui_style_summary() {
+        let notice = CacheMissNotice::from_event(&ApiEvent::KvCacheMiss {
+            session_id: "cache".into(),
+            reason: "low_read".into(),
+            harness_caused: false,
+            missed_tokens: 2_050,
+            expected_tokens: 84_300,
+            read_tokens: 82_300,
+            documented_cause: None,
+            message: "KV cache miss [low_read] [prefix unchanged]: ~2.05K tokens resent".into(),
+        })
+        .unwrap();
+        assert_eq!(notice.label(), "2.05K KV cache miss");
+        assert_eq!(notice.details(), " · low read · prefix unchanged · 98% hit");
+        assert_eq!(
+            notice.text(),
+            "2.05K KV cache miss · low read · prefix unchanged · 98% hit"
+        );
     }
 
     #[gpui::test]
