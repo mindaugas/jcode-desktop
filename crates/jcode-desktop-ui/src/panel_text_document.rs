@@ -73,8 +73,21 @@ impl TranscriptTextDocument {
                 continue;
             }
             let segments = segments(item, row.index, prompt_expanded, tool_expanded);
-            self.rows.insert(row.index, (fingerprint, segments));
-            changed = true;
+            if let Some(entry) = self.rows.get_mut(&row.index) {
+                // Input deltas can change the fingerprint without changing any
+                // selectable text (for example, arguments after a completed
+                // intent in a collapsed tool). Keep the cached segments and
+                // selection document, but remember the new fingerprint.
+                let row_changed = entry.0 & 0b11 != flags || entry.1 != segments;
+                entry.0 = fingerprint;
+                if row_changed {
+                    entry.1 = segments;
+                    changed = true;
+                }
+            } else {
+                self.rows.insert(row.index, (fingerprint, segments));
+                changed = true;
+            }
         }
         self.settled_revision = Some(items.revision());
         if !changed {
@@ -402,6 +415,116 @@ mod tests {
             TranscriptRowSource::Owned(Box::new(Item::Assistant("partial more".into())));
         let doc = cache.sync(&items, &live, &prompts, &tools).unwrap();
         assert!(doc.iter().any(|(_, text)| text.contains("partial more")));
+    }
+
+    #[test]
+    fn streaming_tool_input_reuses_collapsed_document_but_updates_expanded_detail() {
+        let items = Transcript::default();
+        let prompts = HashSet::new();
+        let mut tools = HashSet::new();
+        let mut input = r#"{"intent":"Inspect the workspace","command":""#.to_string();
+        let mut collapsed = TranscriptTextDocument::default();
+        let mut expanded = TranscriptTextDocument::default();
+        let mut collapsed_replacements = 0;
+        let mut expanded_replacements = 0;
+        let mut fingerprint_misses = 0;
+        let mut last_fingerprint = None;
+        let mut cached_segments = None;
+        tools.insert("call".into());
+        for delta in 0..=128 {
+            if delta > 0 {
+                input.push_str(&"x".repeat(256));
+            }
+            let mut item = tool();
+            if let Item::Tool {
+                input: value, done, ..
+            } = &mut item
+            {
+                *value = input.clone();
+                *done = false;
+            }
+            let live = vec![TranscriptRenderRow {
+                index: 0,
+                source: TranscriptRowSource::Owned(Box::new(item.clone())),
+                role: None,
+                show_label: false,
+            }];
+            let fingerprint = fingerprint(&item, false, false) & !0b11;
+            if last_fingerprint != Some(fingerprint) {
+                fingerprint_misses += 1;
+            }
+            last_fingerprint = Some(fingerprint);
+            if let Some(doc) = collapsed.sync(&items, &live, &prompts, &HashSet::new()) {
+                collapsed_replacements += 1;
+                assert!(doc.iter().any(|(_, text)| text == "Inspect the workspace"));
+                cached_segments = Some(collapsed.rows[&0].1.as_ptr());
+            }
+            assert_eq!(collapsed.rows[&0].0, fingerprint);
+            assert_eq!(Some(collapsed.rows[&0].1.as_ptr()), cached_segments);
+            if let Some(doc) = expanded.sync(&items, &live, &prompts, &tools) {
+                expanded_replacements += 1;
+                assert!(
+                    doc.iter()
+                        .any(|(key, text)| { key == "tool-detail-0" && text.contains(&input) })
+                );
+            }
+            assert!(
+                collapsed
+                    .sync(&items, &live, &prompts, &HashSet::new())
+                    .is_none()
+            );
+            assert!(expanded.sync(&items, &live, &prompts, &tools).is_none());
+        }
+        assert_eq!(fingerprint_misses, 129);
+        assert_eq!(collapsed_replacements, 1);
+        assert_eq!(expanded_replacements, 129);
+        eprintln!(
+            "streaming selectable document: {fingerprint_misses} fingerprint misses, {collapsed_replacements} collapsed replacements, {expanded_replacements} expanded replacements (128 collapsed replacements avoided)"
+        );
+    }
+
+    #[test]
+    fn semantic_reuse_preserves_visible_replacements_order_and_disclosure() {
+        let mut cache = TranscriptTextDocument::default();
+        let mut items: Transcript = vec![tool(), Item::Assistant("Answer".into())].into();
+        let prompts = HashSet::new();
+        let mut tools = HashSet::new();
+        let original = cache.sync(&items, &rows(&items), &prompts, &tools).unwrap();
+        // A settled replacement with different hidden output retains the document.
+        if let Item::Tool { output, .. } = &mut items[0] {
+            *output = "replacement hidden output".into();
+        }
+        assert!(
+            cache
+                .sync(&items, &rows(&items), &prompts, &tools)
+                .is_none()
+        );
+        assert_eq!(cache.rows[&0].1, original[..2]);
+        // Visible errors must still invalidate a collapsed row.
+        if let Item::Tool { error, .. } = &mut items[0] {
+            *error = Some("Visible error".into());
+        }
+        let doc = cache.sync(&items, &rows(&items), &prompts, &tools).unwrap();
+        assert!(doc.iter().any(|(_, text)| text == "Visible error"));
+        let mut reordered = rows(&items);
+        reordered.reverse();
+        let doc = cache.sync(&items, &reordered, &prompts, &tools).unwrap();
+        assert_eq!(doc[0].0, "1-0");
+        // A disclosure change is retained even for a row with no detail leaves.
+        if let Item::Tool { name, .. } = &mut items[0] {
+            *name = "todo".into();
+        }
+        cache.sync(&items, &reordered, &prompts, &tools).unwrap();
+        tools.insert("call".into());
+        cache.sync(&items, &reordered, &prompts, &tools).unwrap();
+        assert!(cache.sync(&items, &reordered, &prompts, &tools).is_none());
+        tools.clear();
+        cache.sync(&items, &reordered, &prompts, &tools).unwrap();
+        // Replacing a row's kind must not retain its old selectable keys/text.
+        items[0] = Item::Assistant("Replacement".into());
+        let doc = cache.sync(&items, &reordered, &prompts, &tools).unwrap();
+        assert_eq!(doc.last().unwrap(), &("0-0".into(), "Replacement".into()));
+        assert!(!doc.iter().any(|(key, _)| key.starts_with("tool-")));
     }
 
     #[test]
