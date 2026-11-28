@@ -199,6 +199,7 @@ impl Panel {
             .w_full()
             .max_w(px(MEASURE))
             .mx_auto()
+            .flex_shrink_0()
             .flex()
             .flex_col()
             .gap_8();
@@ -360,7 +361,13 @@ impl Panel {
             // One quiet row: title, view switch, close. Keyboard hints live in
             // the shortcut overlay rather than a permanent footer.
             .child(
-                div().px_5().py_3().flex_shrink_0().child(
+                div()
+                    .px_5()
+                    .py_3()
+                    .flex_shrink_0()
+                    .border_b_1()
+                    .border_color(theme.PANEL_BORDER.opacity(0.35))
+                    .child(
                     div()
                         .w_full()
                         .max_w(px(MEASURE))
@@ -412,9 +419,11 @@ impl Panel {
                     })
                     .flex_1()
                     .min_h_0()
+                    .flex()
+                    .flex_col()
                     .overflow_y_scroll()
                     .px_5()
-                    .pt_4()
+                    .pt_5()
                     .pb_10()
                     .child(content),
             )
