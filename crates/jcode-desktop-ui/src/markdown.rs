@@ -54,8 +54,114 @@ fn indent_depth(line: &str) -> usize {
     (spaces / 2).min(4)
 }
 
+#[cfg(test)]
 fn parse(source: &str) -> Vec<Block> {
     parse_with_line_breaks(source, false)
+}
+
+// Only immutable syntax is retained. Elements, selection IDs, streaming fades,
+// geometry, syntax highlighting and theme colors are rebuilt for every render.
+const PARSE_CACHE_ENTRIES: usize = 128;
+const PARSE_CACHE_BYTES: usize = 4 * 1024 * 1024;
+const PARSE_CACHE_ENTRY_BYTES: usize = 256 * 1024;
+
+struct ParsedEntry {
+    source: Box<str>,
+    preserve_line_breaks: bool,
+    blocks: Arc<Vec<Block>>,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct ParseCache {
+    entries: VecDeque<ParsedEntry>,
+    bytes: usize,
+}
+
+impl ParseCache {
+    fn get(&mut self, source: &str, preserve_line_breaks: bool) -> Option<Arc<Vec<Block>>> {
+        let index = self.entries.iter().position(|entry| {
+            entry.preserve_line_breaks == preserve_line_breaks && entry.source.as_ref() == source
+        })?;
+        let entry = self.entries.remove(index)?;
+        let blocks = Arc::clone(&entry.blocks);
+        self.entries.push_back(entry);
+        Some(blocks)
+    }
+
+    fn insert(&mut self, source: &str, preserve_line_breaks: bool, blocks: Arc<Vec<Block>>) {
+        // Account for capacities, including nested table/quote allocations, not
+        // just source length. The fixed entry limit also bounds container overhead.
+        let bytes = source.len()
+            + std::mem::size_of::<ParsedEntry>()
+            + std::mem::size_of::<Vec<Block>>()
+            + 2 * std::mem::size_of::<usize>()
+            + blocks.capacity() * std::mem::size_of::<Block>()
+            + blocks.iter().map(Block::heap_bytes).sum::<usize>();
+        if bytes > PARSE_CACHE_ENTRY_BYTES || self.get(source, preserve_line_breaks).is_some() {
+            return;
+        }
+        while self.entries.len() >= PARSE_CACHE_ENTRIES || self.bytes + bytes > PARSE_CACHE_BYTES {
+            let Some(entry) = self.entries.pop_front() else {
+                break;
+            };
+            self.bytes -= entry.bytes;
+        }
+        self.bytes += bytes;
+        self.entries.push_back(ParsedEntry {
+            source: source.into(),
+            preserve_line_breaks,
+            blocks,
+            bytes,
+        });
+    }
+}
+
+impl Block {
+    fn heap_bytes(&self) -> usize {
+        fn strings_bytes(strings: &Vec<String>) -> usize {
+            strings.capacity() * std::mem::size_of::<String>()
+                + strings.iter().map(String::capacity).sum::<usize>()
+        }
+        match self {
+            Self::Heading(_, text)
+            | Self::Paragraph(text)
+            | Self::Reasoning(text)
+            | Self::Bullet { text, .. }
+            | Self::Mermaid(text)
+            | Self::HtmlPreview(text)
+            | Self::Math(text) => text.capacity(),
+            Self::Numbered { number, text, .. } => number.capacity() + text.capacity(),
+            Self::Quote(lines) => strings_bytes(lines),
+            Self::Code { lang, body } => lang.capacity() + body.capacity(),
+            Self::Table { header, rows } => {
+                strings_bytes(header)
+                    + rows.capacity() * std::mem::size_of::<Vec<String>>()
+                    + rows.iter().map(strings_bytes).sum::<usize>()
+            }
+            Self::Rule => 0,
+        }
+    }
+}
+
+static PARSE_CACHE: LazyLock<Mutex<ParseCache>> =
+    LazyLock::new(|| Mutex::new(ParseCache::default()));
+
+fn prepared_blocks(source: &str, preserve_line_breaks: bool) -> Arc<Vec<Block>> {
+    // Large streaming responses bypass lookup and retention, but still render.
+    let cacheable = source.len() <= PARSE_CACHE_ENTRY_BYTES;
+    if cacheable
+        && let Ok(mut cache) = PARSE_CACHE.lock()
+        && let Some(blocks) = cache.get(source, preserve_line_breaks)
+    {
+        return blocks;
+    }
+    // Parsing happens outside the lock, including recursive reasoning renders.
+    let blocks = Arc::new(parse_with_line_breaks(source, preserve_line_breaks));
+    if cacheable && let Ok(mut cache) = PARSE_CACHE.lock() {
+        cache.insert(source, preserve_line_breaks, Arc::clone(&blocks));
+    }
+    blocks
 }
 
 fn parse_with_line_breaks(source: &str, preserve_line_breaks: bool) -> Vec<Block> {
@@ -1672,10 +1778,7 @@ fn collect_selection_segments(
     prompt: bool,
     segments: &mut Vec<(SharedString, SharedString)>,
 ) {
-    for (block_index, block) in parse_with_line_breaks(source, prompt)
-        .into_iter()
-        .enumerate()
-    {
+    for (block_index, block) in prepared_blocks(source, prompt).iter().enumerate() {
         let key = format!("{key_prefix}-{block_index}");
         match block {
             Block::Paragraph(text) => {
@@ -1710,7 +1813,7 @@ fn collect_selection_segments(
                 let columns = header
                     .len()
                     .max(rows.iter().map(Vec::len).max().unwrap_or(0));
-                for (row_index, row) in std::iter::once(&header).chain(rows.iter()).enumerate() {
+                for (row_index, row) in std::iter::once(header).chain(rows.iter()).enumerate() {
                     for column in 0..columns {
                         let text = row.get(column).map(String::as_str).unwrap_or("");
                         segments.push((
@@ -1726,7 +1829,7 @@ fn collect_selection_segments(
             | Block::HtmlPreview(body)
             | Block::Mermaid(body)
             | Block::Math(body) => {
-                segments.push((key.into(), body.into()));
+                segments.push((key.into(), body.clone().into()));
             }
             Block::Rule => {}
         }
@@ -1897,11 +2000,7 @@ fn render_document_with_prompt_background(
     avatar: bool,
     prompt_background: Option<gpui::Rgba>,
 ) -> gpui::AnyElement {
-    let blocks = if prompt_background.is_some() {
-        parse_with_line_breaks(source, true)
-    } else {
-        parse(source)
-    };
+    let blocks = prepared_blocks(source, prompt_background.is_some());
     let mut children: Vec<gpui::AnyElement> = Vec::with_capacity(blocks.len());
     let mut previous_was_list = false;
     let fade = STREAM_FADE.take();
@@ -1911,15 +2010,16 @@ fn render_document_with_prompt_background(
         Vec::new()
     };
 
-    for (block_index, block) in blocks.into_iter().enumerate() {
+    for (block_index, block) in blocks.iter().enumerate() {
         // Only prose leaves fade. Table cells and code keep full contrast.
         LEAF_FADE.set(fades.get(block_index).copied().unwrap_or_default());
-        let block = match block {
-            Block::Paragraph(ref text) if reasoning => reasoning_section_title(text)
-                .map(|title| Block::Heading(3, title.to_owned()))
-                .unwrap_or(block),
-            block => block,
+        let promoted = match block {
+            Block::Paragraph(text) if reasoning => {
+                reasoning_section_title(text).map(|title| Block::Heading(3, title.to_owned()))
+            }
+            _ => None,
         };
+        let block = promoted.as_ref().unwrap_or(block);
         let text_key = || -> SharedString { format!("{key_prefix}-{block_index}").into() };
         let is_list = matches!(block, Block::Bullet { .. } | Block::Numbered { .. });
         let tight = is_list && previous_was_list;
@@ -1984,7 +2084,7 @@ fn render_document_with_prompt_background(
                             .line_height(relative(1.35))
                             .child(inline_text(&text)),
                     )
-                    .when(!reasoning && level <= 2, |el| {
+                    .when(!reasoning && *level <= 2, |el| {
                         el.child(div().h(px(1.0)).w_full().bg(Theme::global().PANEL_BORDER))
                     })
                     .into_any_element()
@@ -2028,7 +2128,7 @@ fn render_document_with_prompt_background(
                     None => Theme::global().ACCENT_MUTED,
                 };
                 list_row(
-                    depth,
+                    *depth,
                     marker,
                     marker_color,
                     &text,
@@ -2037,7 +2137,7 @@ fn render_document_with_prompt_background(
                     window,
                     cx,
                     tight,
-                    task,
+                    *task,
                     first_line_avatar,
                 )
             }
@@ -2046,7 +2146,7 @@ fn render_document_with_prompt_background(
                 number,
                 text,
             } => list_row(
-                depth,
+                *depth,
                 format!("{number}."),
                 if reasoning {
                     Theme::global().REASONING
@@ -2120,7 +2220,8 @@ fn render_document_with_prompt_background(
                 code_block_with_selection(&lang, &body, window, Some((selection, text_key(), cx)))
             }
             Block::HtmlPreview(body) if !reasoning => {
-                crate::html_preview::HtmlPreview::new(body, row, block_index).into_any_element()
+                crate::html_preview::HtmlPreview::new(body.clone(), row, block_index)
+                    .into_any_element()
             }
             Block::HtmlPreview(body) => code_block_with_selection(
                 "html-preview",
@@ -2213,8 +2314,8 @@ fn list_row(
 }
 
 fn table(
-    header: Vec<String>,
-    rows: Vec<Vec<String>>,
+    header: &[String],
+    rows: &[Vec<String>],
     selection: &gpui::Entity<TextSelection>,
     key: SharedString,
     window: &gpui::Window,
@@ -2266,7 +2367,7 @@ fn table(
                     )
                 })),
         )
-        .children(rows.into_iter().enumerate().map(|(row_index, row)| {
+        .children(rows.iter().enumerate().map(|(row_index, row)| {
             div()
                 .flex()
                 .flex_row()
@@ -2287,6 +2388,149 @@ fn table(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cache_document(cache: &mut ParseCache, source: &str, prompt: bool) -> Arc<Vec<Block>> {
+        if let Some(blocks) = cache.get(source, prompt) {
+            return blocks;
+        }
+        let blocks = Arc::new(parse_with_line_breaks(source, prompt));
+        cache.insert(source, prompt, Arc::clone(&blocks));
+        blocks
+    }
+
+    #[test]
+    fn parse_cache_exact_source_and_prompt_identity() {
+        let mut cache = ParseCache::default();
+        let source = "first line\nsecond line";
+        let original = cache_document(&mut cache, source, false);
+        assert!(Arc::ptr_eq(
+            &original,
+            &cache_document(&mut cache, source, false)
+        ));
+        let prompt = cache_document(&mut cache, source, true);
+        assert_ne!(original, prompt);
+        let changed = cache_document(&mut cache, "first line\nSECOND line", false);
+        assert_ne!(original, changed);
+        assert_eq!(*changed, parse("first line\nSECOND line"));
+        assert_eq!(cache.entries.len(), 3);
+        cache.insert(source, false, Arc::clone(&original));
+        assert_eq!(
+            cache.entries.len(),
+            3,
+            "duplicate inserts must not consume capacity"
+        );
+    }
+
+    #[test]
+    fn parse_cache_streaming_prefixes_match_fresh_parse() {
+        let mut cache = ParseCache::default();
+        let source = "# Héading\n\n**streaming**\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n```html-preview\n<h1>Hi</h1>\n```\n";
+        for prompt in [false, true] {
+            for end in (0..=source.len()).filter(|end| source.is_char_boundary(*end)) {
+                let prefix = &source[..end];
+                let cached = cache_document(&mut cache, prefix, prompt);
+                assert_eq!(*cached, parse_with_line_breaks(prefix, prompt));
+            }
+        }
+        assert!(matches!(
+            cache_document(&mut cache, source, false).last(),
+            Some(Block::HtmlPreview(_))
+        ));
+        // A revised response is not an append-only cache identity either.
+        let revised = source.replace("html-preview", "rust");
+        assert!(matches!(
+            cache_document(&mut cache, &revised, false).last(),
+            Some(Block::Code { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_cache_lru_eviction_keeps_live_readers_valid() {
+        let mut cache = ParseCache::default();
+        let first = cache_document(&mut cache, "entry 0", false);
+        for index in 1..PARSE_CACHE_ENTRIES {
+            cache_document(&mut cache, &format!("entry {index}"), false);
+        }
+        assert!(cache.get("entry 0", false).is_some());
+        cache_document(&mut cache, "overflow", false);
+        assert_eq!(cache.entries.len(), PARSE_CACHE_ENTRIES);
+        assert!(cache.get("entry 1", false).is_none());
+        assert!(Arc::ptr_eq(&first, &cache.get("entry 0", false).unwrap()));
+        for index in 0..PARSE_CACHE_ENTRIES {
+            cache_document(&mut cache, &format!("replacement {index}"), false);
+        }
+        assert!(cache.get("entry 0", false).is_none());
+        assert_eq!(*first, parse("entry 0"));
+        assert_eq!(
+            cache.bytes,
+            cache.entries.iter().map(|entry| entry.bytes).sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn parse_cache_bounds_nested_allocations_and_oversized_entries() {
+        let mut cache = ParseCache::default();
+        // Nested tables carry vector/string capacity beyond their source bytes.
+        let table = format!(
+            "| a | b |\n| --- | --- |\n{}",
+            "| abc | def |\n".repeat(500)
+        );
+        for index in 0..PARSE_CACHE_ENTRIES {
+            cache_document(&mut cache, &format!("{index}\n\n{table}"), false);
+            assert!(cache.bytes <= PARSE_CACHE_BYTES);
+        }
+        assert!(
+            cache.entries.len() < PARSE_CACHE_ENTRIES,
+            "byte limit must evict before entry limit"
+        );
+        let count = cache.entries.len();
+        let bytes = cache.bytes;
+        let huge = "x".repeat(PARSE_CACHE_ENTRY_BYTES + 1);
+        assert_eq!(*cache_document(&mut cache, &huge, false), parse(&huge));
+        assert!(cache.get(&huge, false).is_none());
+        assert_eq!((cache.entries.len(), cache.bytes), (count, bytes));
+        assert!(
+            cache
+                .entries
+                .iter()
+                .all(|entry| entry.bytes <= PARSE_CACHE_ENTRY_BYTES)
+        );
+    }
+
+    #[test]
+    #[ignore = "manual parse-stage microbenchmark, not a whole-app pan benchmark"]
+    fn parse_cache_preparation_microbenchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let section = "## Preparation\n\nA paragraph with **bold**, `code`, and [links](https://example.com).\nMore words on the next line.\n\n- first item\n  - nested item\n- [x] finished\n\n| Name | Value |\n| --- | --- |\n| cache | ready |\n\n```rust\nfn example() { println!(\"hello\"); }\n```\n\n> quoted text\n> second line\n\n";
+        let sources: Vec<_> = (0..32)
+            .map(|index| format!("# Message {index}\n\n{}", section.repeat(8)))
+            .collect();
+        let iterations = 300;
+        let start = Instant::now();
+        for _ in 0..iterations {
+            for source in &sources {
+                black_box(parse_with_line_breaks(black_box(source), false));
+            }
+        }
+        let uncached = start.elapsed();
+        for source in &sources {
+            black_box(prepared_blocks(source, false));
+        }
+        let start = Instant::now();
+        for _ in 0..iterations {
+            for source in &sources {
+                black_box(prepared_blocks(black_box(source), false));
+            }
+        }
+        let cached = start.elapsed();
+        println!(
+            "parse-stage only: {} documents x {iterations}, {} bytes/document; uncached={uncached:?}, warm-cache={cached:?}, ratio={:.2}x",
+            sources.len(),
+            sources[0].len(),
+            uncached.as_secs_f64() / cached.as_secs_f64()
+        );
+    }
 
     #[gpui::test]
     fn pinned_prompt_selection_namespace_is_independent(cx: &mut gpui::TestAppContext) {
