@@ -67,6 +67,9 @@ def cadence_summary(frames):
 def view_totals(frames):
     """Per-view renders and render time summed over sampling windows, busiest first.
 
+    Counts and total time are capture-local, but max_ms is a cumulative high-water
+    mark from the render-stat table and can predate this capture. Keep that field
+    for compatibility, never interpret it as a capture-local spike.
     Samples from builds without render attribution simply contribute nothing."""
     totals = {}
     for frame in frames:
@@ -82,10 +85,11 @@ def print_view_totals(totals, seconds):
     if not totals:
         print("No per-view render attribution in samples (older build).")
         return
-    print(f"{'view':24s} {'renders/s':>10s} {'ms/s':>8s} {'mean ms':>8s} {'max ms':>8s}")
+    print("Per-view max is cumulative and may predate this capture. It is not a capture-local spike.")
+    print(f"{'view':24s} {'renders/s':>10s} {'ms/s':>8s} {'mean ms':>8s} {'cumulative max ms':>17s}")
     for name, entry in list(totals.items())[:15]:
         print(f"{name:24s} {entry['renders'] / seconds:10.1f} {entry['total_ms'] / seconds:8.2f} "
-              f"{entry['total_ms'] / entry['renders']:8.2f} {entry['max_ms']:8.2f}")
+              f"{entry['total_ms'] / entry['renders']:8.2f} {entry['max_ms']:17.2f}")
 
 
 def cause_totals(frames):
@@ -139,6 +143,7 @@ def analyze(output):
     # longest-running one instead of summing duplicates.
     longest = max(groups.values(), key=len)
     summary['views'] = view_totals(longest)
+    summary['view_max_scope'] = 'cumulative, may predate capture'
     seconds = sum(s['interval_ms'] for s in longest) / 1000
     print("Views rendered (render() time only; layout/paint is in draw time):")
     print_view_totals(summary['views'], seconds or 1)

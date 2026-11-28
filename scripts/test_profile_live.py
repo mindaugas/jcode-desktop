@@ -27,7 +27,7 @@ class ProfileLiveTests(unittest.TestCase):
             output = root / 'capture'
             def first_sample(pid):
                 capture_id = json.loads((root / 'jcode-desktop-profile.json').read_text())['capture_id']
-                frame = dict(unix_ms=1000, input_frame_count=0, draw_count=1,
+                frame = dict(unix_ms=1000, interval_ms=1000, input_frame_count=0, draw_count=1,
                              ui_wake_lag_ms=0, draw_max_ms=2, input_max_ms=None,
                              animation_present_p95_ms=None)
                 (root / f'jcode-desktop-profile-{pid}-{capture_id}.jsonl').write_text(json.dumps(frame) + '\n')
@@ -72,7 +72,7 @@ class ProfileLiveTests(unittest.TestCase):
         scratch.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=scratch) as directory:
             root = Path(directory)
-            base = dict(unix_ms=1000, pid=42, window='main', input_frame_count=0,
+            base = dict(unix_ms=1000, interval_ms=1000, pid=42, window='main', input_frame_count=0,
                         draw_count=2, ui_wake_lag_ms=0, draw_max_ms=3,
                         input_max_ms=None, animation_present_count=2,
                         animation_present_p95_ms=20)
@@ -95,6 +95,37 @@ class ProfileLiveTests(unittest.TestCase):
         self.assertGreater(after["rss_kb"], 0)
         self.assertEqual(set(after["pressure"]), {"cpu", "io", "memory"})
 
+    def test_view_max_is_labeled_cumulative_not_a_capture_local_spike(self):
+        # A previous slow render can remain the high-water mark even though all
+        # render time in these sampling windows adds up to only six ms.
+        frames = [dict(views=[['panel', 2, 4.0, 120.0]]),
+                  dict(views=[['panel', 1, 2.0, 120.0]])]
+        totals = profile.view_totals(frames)
+        self.assertEqual(totals['panel'], dict(renders=3, total_ms=6.0, max_ms=120.0))
+        text = io.StringIO()
+        with contextlib.redirect_stdout(text):
+            profile.print_view_totals(totals, 2)
+        output = text.getvalue()
+        self.assertIn('cumulative max ms', output)
+        self.assertIn('may predate this capture', output)
+        self.assertIn('not a capture-local spike', output)
+        self.assertEqual(output.splitlines()[-1].split(), ['panel', '1.5', '3.00', '2.00', '120.00'])
+
+    def test_view_max_retains_largest_cumulative_value(self):
+        frames = [dict(views=[['panel', 1, 2.0, 120.0]]),
+                  dict(views=[['panel', 1, 150.0, 150.0]]),
+                  dict(views=[['panel', 1, 1.0, 10.0]])]
+        self.assertEqual(profile.view_totals(frames)['panel']['max_ms'], 150.0)
+
+    def test_legacy_capture_does_not_invent_view_maxima(self):
+        totals = profile.view_totals([{}, dict(views=None), dict(views=[])])
+        self.assertEqual(totals, {})
+        text = io.StringIO()
+        with contextlib.redirect_stdout(text):
+            profile.print_view_totals(totals, 1)
+        self.assertIn('No per-view render attribution', text.getvalue())
+        self.assertNotIn('cumulative max ms', text.getvalue())
+
     def test_idle_is_not_reported_as_successful_input_validation(self):
         self.check_analysis(input_count=0, input_max=None, expected_slow=0, inconclusive=True)
 
@@ -106,7 +137,7 @@ class ProfileLiveTests(unittest.TestCase):
         scratch.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=scratch) as directory:
             root = Path(directory)
-            frame = {"unix_ms": 1000, "input_frame_count": input_count, "draw_count": 2,
+            frame = {"unix_ms": 1000, "interval_ms": 1000, "input_frame_count": input_count, "draw_count": 2,
                      "ui_wake_lag_ms": 1.0, "draw_max_ms": 3.0, "input_max_ms": input_max,
                      "animation_present_p95_ms": None}
             (root / "frames.jsonl").write_text(json.dumps(frame) + "\n")
@@ -116,6 +147,7 @@ class ProfileLiveTests(unittest.TestCase):
                 result = profile.analyze(root)
             self.assertEqual(result["input_over_50ms_windows"], expected_slow)
             self.assertEqual(result["input_frames"], input_count)
+            self.assertEqual(result['view_max_scope'], 'cumulative, may predate capture')
             self.assertEqual("INCONCLUSIVE FOR INPUT LAG" in text.getvalue(), inconclusive)
             self.assertIn("INCONCLUSIVE FOR SUSTAINED FPS", text.getvalue())
             self.assertEqual(json.loads((root / "summary.json").read_text()), result)
