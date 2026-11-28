@@ -179,17 +179,76 @@ fn clipped(window: &mut Window, clip: Bounds<Pixels>, f: impl FnOnce(&mut Window
     window.with_content_mask(Some(ContentMask { bounds: clip }), f);
 }
 
-/// A soft vertical band centred at `center`, fading to nothing on both sides.
-fn band(window: &mut Window, bounds: Bounds<Pixels>, center: f32, width: f32, peak: Rgba) {
-    let clear = Rgba { a: 0., ..peak };
-    let top = bounds.origin.y;
-    let height = bounds.size.height;
+/// Clamp a horizontal linear alpha ramp `[x0, x1]` to the tab's `[left, left + width]`
+/// and return `(clip_left, clip_width, u0, u1, a0, a1)` in normalized `[0, 1]`
+/// gradient coordinates along `bounds`.
+fn clamped_ramp(
+    left: f32,
+    width: f32,
+    x0: f32,
+    x1: f32,
+    a0: f32,
+    a1: f32,
+) -> Option<(f32, f32, f32, f32, f32, f32)> {
+    if width <= 0.0 || x1 <= x0 {
+        return None;
+    }
+    let right = left + width;
+    let cx0 = x0.max(left);
+    let cx1 = x1.min(right);
+    if cx1 <= cx0 {
+        return None;
+    }
+    let span = x1 - x0;
+    let t0 = (cx0 - x0) / span;
+    let t1 = (cx1 - x0) / span;
+    let ca0 = a0 + (a1 - a0) * t0;
+    let ca1 = a0 + (a1 - a0) * t1;
+    let u0 = ((cx0 - left) / width).clamp(0.0, 1.0);
+    let u1 = ((cx1 - left) / width).clamp(0.0, 1.0);
+    Some((cx0, cx1 - cx0, u0, u1, ca0, ca1))
+}
+
+/// A soft vertical band centred at `center`, fading to nothing on both sides,
+/// painted as a rounded pill quad clipped horizontally so it never bleeds past
+/// the tab's rounded corners.
+fn band(
+    window: &mut Window,
+    bounds: Bounds<Pixels>,
+    radius: f32,
+    center: f32,
+    width: f32,
+    peak: Rgba,
+) {
+    let left = f32::from(bounds.origin.x);
+    let total_width = f32::from(bounds.size.width);
     let half = width / 2.0;
-    for (left, from, to) in [(center - half, clear, peak), (center, peak, clear)] {
-        window.paint_quad(gpui::fill(
-            Bounds::new(point(px(left), top), size(px(half), height)),
-            linear_gradient(90., linear_color_stop(from, 0.), linear_color_stop(to, 1.)),
-        ));
+    for (x0, x1, a0, a1) in [
+        (center - half, center, 0.0, peak.a),
+        (center, center + half, peak.a, 0.0),
+    ] {
+        let Some((clip_left, clip_width, u0, u1, ca0, ca1)) =
+            clamped_ramp(left, total_width, x0, x1, a0, a1)
+        else {
+            continue;
+        };
+        let slice = Bounds::new(
+            point(px(clip_left), bounds.origin.y),
+            size(px(clip_width), bounds.size.height),
+        );
+        clipped(window, slice, |window| {
+            window.paint_quad(
+                gpui::fill(
+                    bounds,
+                    linear_gradient(
+                        90.,
+                        linear_color_stop(Rgba { a: ca0, ..peak }, u0),
+                        linear_color_stop(Rgba { a: ca1, ..peak }, u1),
+                    ),
+                )
+                .corner_radii(px(radius)),
+            );
+        });
     }
 }
 
@@ -229,6 +288,7 @@ fn paint(
                     band(
                         window,
                         bounds,
+                        radius,
                         left + filled - 3.0,
                         6.0,
                         ring.color.opacity(0.28),
@@ -242,9 +302,14 @@ fn paint(
                 let t = (now / SWEEP_SECONDS).fract();
                 let travel = width + band_width * 2.0;
                 let center = left - band_width + travel * (t * 1.25).min(1.0);
-                clipped(window, bounds, |window| {
-                    band(window, bounds, center, band_width, ring.color.opacity(0.22));
-                });
+                band(
+                    window,
+                    bounds,
+                    radius,
+                    center,
+                    band_width,
+                    ring.color.opacity(0.22),
+                );
             }
             window.paint_quad(outline(ring.color.opacity(0.55)));
         }
@@ -355,5 +420,22 @@ mod tests {
         assert!(outline.shown_progress.unwrap() > 0.0);
         assert!(!outline.ease_progress(Some(0.5), true));
         assert_eq!(outline.shown_progress, Some(0.5));
+    }
+
+    #[test]
+    fn clamped_ramp_clips_band_to_tab_bounds() {
+        // Completely outside to the left or right produces no slice.
+        assert!(clamped_ramp(10.0, 100.0, -20.0, 10.0, 0.0, 0.2).is_none());
+        assert!(clamped_ramp(10.0, 100.0, 110.0, 140.0, 0.2, 0.0).is_none());
+
+        // Partially overlapping left edge interpolates starting alpha and starts at u=0.
+        let (clip_left, clip_width, u0, u1, ca0, ca1) =
+            clamped_ramp(10.0, 100.0, 0.0, 20.0, 0.0, 0.2).unwrap();
+        assert!((clip_left - 10.0).abs() < 1e-5);
+        assert!((clip_width - 10.0).abs() < 1e-5);
+        assert!((u0 - 0.0).abs() < 1e-5);
+        assert!((u1 - 0.1).abs() < 1e-5);
+        assert!((ca0 - 0.1).abs() < 1e-5);
+        assert!((ca1 - 0.2).abs() < 1e-5);
     }
 }
