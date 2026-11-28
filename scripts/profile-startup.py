@@ -63,7 +63,8 @@ def summary(values):
                 p95_ms=ordered[math.ceil(.95 * len(ordered)) - 1], max_ms=ordered[-1])
 
 
-def sample_env(root, jcode, driver, timeout, trace_startup=False, software_presentation=False):
+def sample_env(root, jcode, driver, timeout, trace_startup=False, software_presentation=False,
+               pipeline_workers=None):
     for name in ('home', 'runtime', 'config', 'cache', 'data', 'jcode', 'tmp', 'shims'):
         (root / name).mkdir(mode=0o700)
     # Keep real startup behavior, but select a credential-free provider for the
@@ -83,6 +84,9 @@ def sample_env(root, jcode, driver, timeout, trace_startup=False, software_prese
         env.pop('LIBGL_ALWAYS_SOFTWARE', None)
     if trace_startup:
         env['JCODE_DESKTOP_TRACE_STARTUP'] = '1'
+        env['GPUI_PIPELINE_TIMING'] = '1'
+    if pipeline_workers is not None:
+        env['GPUI_PIPELINE_WORKERS'] = str(pipeline_workers)
     if software_presentation:
         # Xvfb has no DRI3. Mesa can render on the selected GPU and copy its
         # swapchain to X11 in software. The graphics diagnostic still identifies
@@ -183,7 +187,7 @@ class Children:
 def run_sample(root, index, args, binary, jcode, driver):
     root.mkdir(mode=0o700)
     env = sample_env(root, jcode, driver, args.timeout, args.trace_startup,
-                     args.software_presentation)
+                     args.software_presentation, args.pipeline_workers)
     children = Children(root, env)
     read_fd, write_fd = os.pipe()
     state_path = root / 'state'
@@ -295,7 +299,8 @@ def run_sample(root, index, args, binary, jcode, driver):
         if diagnostics.exists():
             lines = diagnostics.read_text().splitlines()
             sample['graphics'] = next((line for line in lines if 'desktop graphics:' in line), None)
-            sample['startup_trace'] = [line for line in lines if 'desktop startup' in line]
+            sample['startup_trace'] = [line for line in lines
+                                       if 'desktop startup' in line or 'gpui_pipeline_timing' in line]
         sample['hardware_verified'] = 'is_software_emulated: false' in (sample.get('graphics') or '')
         if args.require_hardware and not sample['hardware_verified']:
             raise RuntimeError('Hardware rendering required but graphics diagnostic is software or missing: '
@@ -326,6 +331,8 @@ def main():
                         help='fail if app diagnostics report software rendering or omit GPU evidence')
     parser.add_argument('--trace-startup', action='store_true',
                         help='set JCODE_DESKTOP_TRACE_STARTUP=1 and save app checkpoint logs')
+    parser.add_argument('--pipeline-workers', type=int, choices=(1, 2, 4),
+                        help='GPUI pipeline compilation workers for same-binary comparisons')
     parser.add_argument('--samples', type=int, default=8)
     parser.add_argument('--timeout', type=float, default=60)
     parser.add_argument('--poll-ms', type=float, default=2)
@@ -367,6 +374,7 @@ def main():
                   companion_prestarted=False, driver=str(driver),
                   renderer='Mesa lavapipe' if driver.name.startswith('lvp') else 'Selected Vulkan ICD (see sample graphics)',
                   single_panel=args.single_panel, trace_startup=args.trace_startup,
+                  pipeline_workers=args.pipeline_workers,
                   software_presentation=args.software_presentation, require_hardware=args.require_hardware,
                   resolution='1440x1000x24',
                   first_window_observer='Independent xdotool polling, interval plus subprocess overhead',

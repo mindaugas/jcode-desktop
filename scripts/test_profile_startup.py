@@ -89,13 +89,14 @@ class StartupProfileTests(unittest.TestCase):
                 self.assertTrue(args.trace_startup)
                 self.assertTrue(args.require_hardware)
                 self.assertTrue(args.software_presentation)
+                self.assertEqual(args.pipeline_workers, 4)
                 self.assertEqual(driver, root / 'intel_icd.json')
                 return dict(sample=index, first_window_ms=10, render_state_ms=20, focused_panel_ms=20)
 
             argv = ['profile-startup.py', str(output), '--binary', str(binary),
                     '--jcode', str(companion), '--samples', '2', '--no-verify-input',
                     '--single-panel', '--trace-startup', '--driver', str(driver),
-                    '--require-hardware', '--software-presentation']
+                    '--require-hardware', '--software-presentation', '--pipeline-workers', '4']
             with patch.object(sys, 'argv', argv), \
                     patch.object(profile.shutil, 'which', return_value='/bin/true'), \
                     patch.object(Path, 'glob', return_value=iter([Path('/driver.json')])), \
@@ -108,6 +109,7 @@ class StartupProfileTests(unittest.TestCase):
             self.assertTrue(result['trace_startup'])
             self.assertTrue(result['require_hardware'])
             self.assertTrue(result['software_presentation'])
+            self.assertEqual(result['pipeline_workers'], 4)
             self.assertEqual(result['driver'], str(driver))
             self.assertEqual(result['binary_sha256'], profile.sha256(binary))
             self.assertEqual(result['summary']['render_state_ms']['count'], 2)
@@ -116,11 +118,14 @@ class StartupProfileTests(unittest.TestCase):
         for driver, software in [('intel_icd.json', False), ('lvp_icd.json', True)]:
             with self.subTest(driver=driver), tempfile.TemporaryDirectory() as temporary:
                 env = profile.sample_env(Path(temporary), Path('/jcode'), Path('/' + driver),
-                                         60, trace_startup=True, software_presentation=True)
+                                         60, trace_startup=True, software_presentation=True,
+                                         pipeline_workers=4)
                 self.assertEqual(env['MESA_VK_WSI_DEBUG'], 'sw')
                 self.assertEqual(env['VK_DRIVER_FILES'], '/' + driver)
                 self.assertEqual('LIBGL_ALWAYS_SOFTWARE' in env, software)
                 self.assertEqual(env['JCODE_DESKTOP_TRACE_STARTUP'], '1')
+                self.assertEqual(env['GPUI_PIPELINE_TIMING'], '1')
+                self.assertEqual(env['GPUI_PIPELINE_WORKERS'], '4')
 
     def test_environment_is_private_and_has_no_fixture_or_real_secrets(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -130,7 +135,8 @@ class StartupProfileTests(unittest.TestCase):
                                          'JCODE_API_SOCKET': '/real/api.sock'}):
                 env = profile.sample_env(root, Path('/opt/private jcode'), Path('/driver.json'), 60)
             for key in ('ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'DISPLAY', 'SSH_AUTH_SOCK',
-                        'JCODE_DESKTOP_SCREENSHOT', 'JCODE_DESKTOP_UI', 'MESA_VK_WSI_DEBUG'):
+                        'JCODE_DESKTOP_SCREENSHOT', 'JCODE_DESKTOP_UI', 'MESA_VK_WSI_DEBUG',
+                        'GPUI_PIPELINE_WORKERS', 'GPUI_PIPELINE_TIMING'):
                 self.assertNotIn(key, env)
             for key in ('HOME', 'XDG_RUNTIME_DIR', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME',
                         'XDG_DATA_HOME', 'XDG_STATE_HOME', 'JCODE_HOME', 'JCODE_API_SOCKET',

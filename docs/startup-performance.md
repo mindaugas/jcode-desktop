@@ -15,6 +15,44 @@ four wins/four losses. The font-prewarm experiment was removed rather than
 shipping a change supported only by an isolated work-duration measurement.
 Evidence: `target/startup-intel-verified/results.json`.
 
+## Shipped optimization: parallel Linux/Vulkan pipelines
+
+GPUI now constructs its nine independent render pipelines using at most four
+workers (including the calling thread), bounded by available CPU parallelism.
+Descriptors, ordering of returned pipelines, blending, sample counts, and shader
+validation are unchanged. All jobs complete before the window uses the results.
+Linux/Vulkan is enabled by default. Other backends and Web remain serial, and
+`GPUI_PIPELINE_WORKERS=1` opts out. The fix is upstream in GPUI, pinned by Desktop,
+not a Desktop-only renderer workaround.
+
+Ten interleaved pairs used **the exact same release executable**, changing only
+`GPUI_PIPELINE_WORKERS=1` versus `4`, with fresh per-launch application/shader
+caches and verified Intel Arc B390 Vulkan rendering:
+
+| Metric | Serial | Four workers |
+| --- | ---: | ---: |
+| Launch to rendered focused panel, median | 286.8 ms | 212.7 ms |
+| Launch to rendered focused panel, p95 | 369.0 ms | 281.4 ms |
+| Render-pipeline construction, median | 112.5 ms | 48.1 ms |
+
+The median startup measurement fell **25.8%**. Parallel won 8 of 10 paired
+launches, with median paired reduction 76.9 ms. Native typed text was verified
+in the first serial and parallel launch, and the accelerated screenshot was
+visually inspected. This is private X11 with GPU rendering and software
+presentation, not a measurement of the active Wayland compositor.
+
+Evidence: `target/startup-gpu-pairs/results.json`, binary SHA-256
+`2679cf798f7c9f129c574c2fa3c3fb3da7ba69afad571883935a7a763b72e11b`.
+The tested candidate had serial default; the final revision changes the default
+only for Linux/Vulkan and adds a regression test for that backend policy.
+GPUI's 45 tests pass, including bounded concurrency, exactly-once execution,
+result ordering, empty/single job handling, panic propagation, and backend policy.
+The final default-on release passed the Desktop workspace suite and two fresh
+hardware/native-typing checks without a worker override: rendered state at
+227.5 ms and 178.5 ms, pipeline creation at 38.5 ms and 34.6 ms. These are
+acceptance smoke checks, not additional paired speedup estimates. Evidence:
+`target/startup-default-final/results.json` and `target/startup-final-ui.png`.
+
 ## Reproduce
 
 ```sh
@@ -25,6 +63,8 @@ python3 scripts/profile-startup.py target/startup-measure --samples 8 --trace-st
 python3 scripts/profile-startup.py target/startup-gpu --samples 8 --single-panel \
   --trace-startup --driver /usr/share/vulkan/icd.d/intel_icd.json \
   --software-presentation --require-hardware
+# Compare the same binary with --pipeline-workers 1 and --pipeline-workers 4.
+# --trace-startup also collects GPUI shader/pipeline phase timings.
 python3 scripts/screenshot.py target/startup-ui.png --no-build \
   --binary target/release/jcode-desktop --transcript empty
 ```
