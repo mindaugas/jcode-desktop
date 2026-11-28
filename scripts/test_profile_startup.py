@@ -127,16 +127,29 @@ class StartupProfileTests(unittest.TestCase):
                 self.assertEqual(env['GPUI_PIPELINE_TIMING'], '1')
                 self.assertEqual(env['GPUI_PIPELINE_WORKERS'], '4')
 
+    def test_startup_experiments_are_explicit_and_isolated(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as temporary:
+                env = profile.sample_env(Path(temporary), Path('/jcode'), Path('/intel_icd.json'),
+                                         60, early_present=enabled, background_fonts=enabled,
+                                         vulkan_first=enabled, early_window=enabled)
+                for key in ('GPUI_EARLY_PRESENT', 'GPUI_BACKGROUND_FONTS',
+                            'GPUI_VULKAN_FIRST', 'JCODE_DESKTOP_EARLY_WINDOW'):
+                    self.assertEqual(env[key], '1' if enabled else '0')
+
     def test_environment_is_private_and_has_no_fixture_or_real_secrets(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             with patch.dict(os.environ, {'ANTHROPIC_API_KEY': 'secret', 'OPENAI_API_KEY': 'secret',
                                          'DISPLAY': ':0', 'SSH_AUTH_SOCK': '/real/agent',
-                                         'JCODE_API_SOCKET': '/real/api.sock'}):
+                                         'JCODE_API_SOCKET': '/real/api.sock',
+                                         'GPUI_EARLY_PRESENT': '1', 'GPUI_BACKGROUND_FONTS': '1',
+                                         'GPUI_VULKAN_FIRST': '1', 'JCODE_DESKTOP_EARLY_WINDOW': '1'}):
                 env = profile.sample_env(root, Path('/opt/private jcode'), Path('/driver.json'), 60)
             for key in ('ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'DISPLAY', 'SSH_AUTH_SOCK',
                         'JCODE_DESKTOP_SCREENSHOT', 'JCODE_DESKTOP_UI', 'MESA_VK_WSI_DEBUG',
-                        'GPUI_PIPELINE_WORKERS', 'GPUI_PIPELINE_TIMING'):
+                        'GPUI_PIPELINE_WORKERS', 'GPUI_PIPELINE_TIMING', 'GPUI_EARLY_PRESENT',
+                        'GPUI_BACKGROUND_FONTS', 'GPUI_VULKAN_FIRST', 'JCODE_DESKTOP_EARLY_WINDOW'):
                 self.assertNotIn(key, env)
             for key in ('HOME', 'XDG_RUNTIME_DIR', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME',
                         'XDG_DATA_HOME', 'XDG_STATE_HOME', 'JCODE_HOME', 'JCODE_API_SOCKET',

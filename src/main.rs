@@ -11,9 +11,12 @@ mod host {
     pub mod reload;
     pub mod reload_config;
     pub mod resources;
+    pub mod startup_policy;
     pub mod window_controls;
 }
 mod diagnostics;
+#[cfg(test)]
+mod startup_frame_tests;
 #[cfg(test)]
 mod voice_command_tests;
 #[cfg(test)]
@@ -31,8 +34,8 @@ use std::{
 };
 
 use gpui::{
-    App, Bounds, KeyBinding, Point, Render, TitlebarOptions, Window, WindowBounds, WindowOptions,
-    actions, div, prelude::*, px, size,
+    Animation, AnimationExt, App, Bounds, KeyBinding, Point, Render, TitlebarOptions, Window,
+    WindowBounds, WindowOptions, actions, div, prelude::*, px, size,
 };
 use gpui_platform::application;
 use jcode_desktop_api::LaunchMode;
@@ -260,6 +263,14 @@ fn rebuild_and_reload(
     .detach();
 }
 
+/// Give the native shell one presentation opportunity before replacing its root.
+/// No fixed delay is imposed, and a closed window drops the pending callbacks.
+fn after_loading_frame(window: &Window, activate: impl FnOnce(&mut App) + 'static) {
+    window.on_next_frame(move |window, _| {
+        window.on_next_frame(move |_, cx| cx.defer(activate));
+    });
+}
+
 struct HostFallback;
 
 impl Render for HostFallback {
@@ -267,11 +278,35 @@ impl Render for HostFallback {
         div()
             .size_full()
             .flex()
+            .flex_col()
+            .gap_4()
             .items_center()
             .justify_center()
             .bg(gpui::rgb(0x111318))
-            .text_color(gpui::rgb(0xe5e7eb))
-            .child("Starting Jcode Desktop…")
+            .child(
+                div()
+                    .relative()
+                    .w(px(120.0))
+                    .h(px(4.0))
+                    .rounded_full()
+                    .overflow_hidden()
+                    .bg(gpui::rgb(0x292c32))
+                    .child(
+                        div()
+                            .absolute()
+                            .h_full()
+                            .w(px(42.0))
+                            .rounded_full()
+                            .bg(gpui::rgb(0x969aa4))
+                            .with_animation(
+                                "desktop-startup-progress",
+                                Animation::new(std::time::Duration::from_millis(900))
+                                    .repeat()
+                                    .with_max_fps(30.0),
+                                |segment, phase| segment.left(px(-42.0 + 162.0 * phase)),
+                            ),
+                    ),
+            )
     }
 }
 
@@ -623,6 +658,7 @@ fn detach_console() {
 fn detach_console() {}
 
 fn main() {
+    host::startup_policy::configure();
     attach_parent_console();
     let startup = std::time::Instant::now();
     let trace_startup = env::var_os("JCODE_DESKTOP_TRACE_STARTUP").is_some();
@@ -935,11 +971,23 @@ fn main() {
             }
         });
 
-        manager
-            .borrow_mut()
-            .activate_initial(cx)
-            .expect("activate linked Jcode Desktop UI");
-        checkpoint("ui-activated");
+        if env::var_os("JCODE_DESKTOP_EARLY_WINDOW").as_deref() == Some(std::ffi::OsStr::new("1")) {
+            // Two frame callbacks leave one complete presentation opportunity for
+            // the font-free host shell before constructing the workspace. No
+            // artificial timer holds back content once that frame is submitted.
+            let manager = manager.clone();
+            window.update(cx, |_, window, _| {
+                after_loading_frame(window, move |cx| {
+                    manager.borrow_mut().activate_initial(cx)
+                        .expect("activate linked Jcode Desktop UI");
+                    checkpoint("ui-activated");
+                });
+            }).expect("schedule initial workspace activation");
+        } else {
+            manager.borrow_mut().activate_initial(cx)
+                .expect("activate linked Jcode Desktop UI");
+            checkpoint("ui-activated");
+        }
         if let Some(path) = plugin_path.as_ref() {
             eprintln!(
                 "Jcode Desktop hot reload enabled: Ctrl+R rebuilds and reloads the latest UI from {}; Ctrl+Shift+R does the same; F6 rolls back",

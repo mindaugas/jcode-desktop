@@ -64,7 +64,8 @@ def summary(values):
 
 
 def sample_env(root, jcode, driver, timeout, trace_startup=False, software_presentation=False,
-               pipeline_workers=None):
+               pipeline_workers=None, early_present=None, background_fonts=None,
+               vulkan_first=None, early_window=None):
     for name in ('home', 'runtime', 'config', 'cache', 'data', 'jcode', 'tmp', 'shims'):
         (root / name).mkdir(mode=0o700)
     # Keep real startup behavior, but select a credential-free provider for the
@@ -85,6 +86,12 @@ def sample_env(root, jcode, driver, timeout, trace_startup=False, software_prese
     if trace_startup:
         env['JCODE_DESKTOP_TRACE_STARTUP'] = '1'
         env['GPUI_PIPELINE_TIMING'] = '1'
+    for name, value in [('GPUI_EARLY_PRESENT', early_present),
+                        ('GPUI_BACKGROUND_FONTS', background_fonts),
+                        ('GPUI_VULKAN_FIRST', vulkan_first),
+                        ('JCODE_DESKTOP_EARLY_WINDOW', early_window)]:
+        if value is not None:
+            env[name] = '1' if value else '0'
     if pipeline_workers is not None:
         env['GPUI_PIPELINE_WORKERS'] = str(pipeline_workers)
     if software_presentation:
@@ -187,7 +194,11 @@ class Children:
 def run_sample(root, index, args, binary, jcode, driver):
     root.mkdir(mode=0o700)
     env = sample_env(root, jcode, driver, args.timeout, args.trace_startup,
-                     args.software_presentation, args.pipeline_workers)
+                     args.software_presentation, args.pipeline_workers,
+                     early_present=getattr(args, 'early_present', None),
+                     background_fonts=getattr(args, 'background_fonts', None),
+                     vulkan_first=getattr(args, 'vulkan_first', None),
+                     early_window=getattr(args, 'early_window', None))
     children = Children(root, env)
     read_fd, write_fd = os.pipe()
     state_path = root / 'state'
@@ -229,6 +240,10 @@ def run_sample(root, index, args, binary, jcode, driver):
         wait(lambda: '_NET_SUPPORTING_WM_CHECK(WINDOW)' in command(
             ['xprop', '-root', '_NET_SUPPORTING_WM_CHECK'], capture_output=True,
             text=True).stdout, 'window manager readiness')
+        # The TUI comparison starts inside an already-running terminal. Likewise
+        # keep compositor startup/theme work outside the Desktop launch interval:
+        # Openbox publishes EWMH before its initialization has fully settled.
+        time.sleep(.25)
         watcher = WindowWatch(env, args.poll_ms)
         started = time.perf_counter()
         launch_args = [str(binary), '--no-hot-reload']
@@ -300,7 +315,9 @@ def run_sample(root, index, args, binary, jcode, driver):
             lines = diagnostics.read_text().splitlines()
             sample['graphics'] = next((line for line in lines if 'desktop graphics:' in line), None)
             sample['startup_trace'] = [line for line in lines
-                                       if 'desktop startup' in line or 'gpui_pipeline_timing' in line]
+                                       if any(marker in line for marker in
+                                              ('desktop startup', 'gpui_pipeline_timing',
+                                               'gpui_context_timing', 'gpui_early_present'))]
         sample['hardware_verified'] = 'is_software_emulated: false' in (sample.get('graphics') or '')
         if args.require_hardware and not sample['hardware_verified']:
             raise RuntimeError('Hardware rendering required but graphics diagnostic is software or missing: '
@@ -333,6 +350,9 @@ def main():
                         help='set JCODE_DESKTOP_TRACE_STARTUP=1 and save app checkpoint logs')
     parser.add_argument('--pipeline-workers', type=int, choices=(1, 2, 4),
                         help='GPUI pipeline compilation workers for same-binary comparisons')
+    for flag in ('early-present', 'background-fonts', 'vulkan-first', 'early-window'):
+        parser.add_argument('--' + flag, action=argparse.BooleanOptionalAction, default=None,
+                            help='explicit same-binary startup experiment override')
     parser.add_argument('--samples', type=int, default=8)
     parser.add_argument('--timeout', type=float, default=60)
     parser.add_argument('--poll-ms', type=float, default=2)
@@ -371,10 +391,12 @@ def main():
     result = dict(binary=str(binary), launch_binary=str(launch_binary), binary_sha256=sha256(launch_binary),
                   companion=str(jcode), companion_sha256=sha256(jcode),
                   samples=[], poll_ms=args.poll_ms, hot_reload=False, fresh_home_per_sample=True,
-                  companion_prestarted=False, driver=str(driver),
+                  companion_prestarted=False, driver=str(driver), compositor_settle_ms=250,
                   renderer='Mesa lavapipe' if driver.name.startswith('lvp') else 'Selected Vulkan ICD (see sample graphics)',
                   single_panel=args.single_panel, trace_startup=args.trace_startup,
                   pipeline_workers=args.pipeline_workers,
+                  early_present=args.early_present, background_fonts=args.background_fonts,
+                  vulkan_first=args.vulkan_first, early_window=args.early_window,
                   software_presentation=args.software_presentation, require_hardware=args.require_hardware,
                   resolution='1440x1000x24',
                   first_window_observer='Independent xdotool polling, interval plus subprocess overhead',

@@ -187,7 +187,7 @@ def run_sample(root, index, args, binary, jcode, driver):
         diagnostics = root / 'logs/jcode-desktop/jcode-desktop.log'
         lines = diagnostics.read_text().splitlines() if diagnostics.exists() else []
         sample['graphics'] = next((line for line in lines if 'desktop graphics:' in line), None)
-        sample['startup_trace'] = [line for line in lines if 'desktop startup' in line or 'gpui_pipeline_timing' in line]
+        sample['startup_trace'] = [line for line in lines if any(marker in line for marker in ('desktop startup', 'gpui_pipeline_timing', 'gpui_context_timing', 'gpui_early_present'))]
         sample['hardware_verified'] = 'is_software_emulated: false' in (sample['graphics'] or '')
         if args.require_hardware and not sample['hardware_verified']:
             raise RuntimeError('Hardware rendering not proven: ' + str(sample['graphics']))
@@ -201,7 +201,7 @@ def run_sample(root, index, args, binary, jcode, driver):
         lines = diagnostics.read_text().splitlines() if diagnostics.exists() else []
         sample['graphics'] = next((line for line in lines if 'desktop graphics:' in line), None)
         sample['gpu_device_lost'] = any('device lost' in line for line in lines)
-        sample['startup_trace'] = [line for line in lines if 'desktop startup' in line or 'gpui_pipeline_timing' in line]
+        sample['startup_trace'] = [line for line in lines if any(marker in line for marker in ('desktop startup', 'gpui_pipeline_timing', 'gpui_context_timing', 'gpui_early_present'))]
         (root / 'sample.json').write_text(json.dumps(sample, indent=2) + '\n')
 
 

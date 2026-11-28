@@ -84,6 +84,60 @@ copying the swapchain to X11 in software. `--require-hardware` checks the actual
 Desktop GPU diagnostic and rejects missing or software-rendered evidence. This
 still does not reproduce the user's native Wayland presentation path.
 
+## First-window startup, November 27 follow-up
+
+The target is now the first native window, not completion of workspace content.
+An isolated PTY benchmark of the installed TUI observed first meaningful text at
+19.4 ms median over ten fresh-daemon launches. A contemporaneous repeat measured
+15.9 ms first text and 82.5 ms rendered native input. This includes process spawn
+but not creating a terminal window or physical scanout. Evidence:
+`target/tui-startup-fresh-10-retry.json`, `target/tui-contemporary-final.json`.
+
+Desktop enables four Linux startup policies at process entry, before threads:
+`GPUI_EARLY_PRESENT`, `GPUI_BACKGROUND_FONTS`, `GPUI_VULKAN_FIRST`, and
+`JCODE_DESKTOP_EARLY_WINDOW`. Explicit environment values, including `0`, win.
+Other platforms retain their existing initialization policy. The native shell
+gets a presentation opportunity before workspace construction. Font discovery
+and full scene-pipeline compilation overlap other startup work. The first GPU
+frame is a shaderless opaque clear, followed, when needed, by a small moving
+rounded loading indicator. Native surfaces never move onto compiler threads.
+Vulkan-first respects explicit device overrides and requires an exact known
+compositor GPU match when a compositor hint exists, otherwise using the original
+combined-backend fallback.
+
+Five alternating same-binary pairs on Intel Arc B390, with fresh application
+and shader caches, measured the following checkpoint (GPUI `36243fa`):
+
+| Metric, median | Policies off | Policies on |
+| --- | ---: | ---: |
+| Native Wayland mapped window | 252.2 ms | 78.9 ms |
+| Wayland focused-panel diagnostic | 343.7 ms | 204.6 ms |
+| Private X11 visible window | 291.3 ms | 44.5 ms |
+| X11 rendered-state diagnostic | 319.3 ms | 195.9 ms |
+
+These are paired observations on a variable-load laptop, not a promise of
+identical timing on every launch. X11 measurement allows its private Openbox
+compositor to settle for 250 ms before the timed launch in both conditions.
+Wayland uses a private headless Sway with real Intel GPU composition, not the
+user's live compositor. Mapping requires a committed client buffer. Neither
+mapping nor diagnostic state proves physical display presentation. Screenshot
+capture times include screencopy/PNG work and are not first-pixel timestamps.
+
+Evidence: `target/early-final-wayland/results.json`,
+`target/early-final-x11/results.json`. Native typing passed in the first pair
+of each mode. Two additional no-override launches confirmed the defaults and
+native typing. The actual loading pill was captured and visually inspected in
+`target/early-final-wayland/00-e1/first-frame.png`. This checkpoint still misses
+the TUI first-text target, especially on Wayland: GPU device initialization
+remains ahead of its first buffer commit.
+
+The renderer passed 129 tests and its upstream guard. Desktop's workspace run
+reported 1,966 passed and 18 ignored, including two pre-existing parallel-test
+flakes that passed isolated retries. Benchmark suites passed 27 tests using the
+TUI profiler's documented pyte environment. Startup activation has a headless
+regression test proving that it waits for the second frame callback without
+adding a fixed timer.
+
 ## Host delivery constraint
 
 The running host's Ctrl+R rebuild succeeded, but activation was safely rejected
