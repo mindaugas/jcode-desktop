@@ -161,6 +161,33 @@ impl RebuildState {
     }
 }
 
+fn is_host_incompatible_reload_error(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("incompatible UI plugin:")
+}
+
+fn spawn_host_restart_worker() -> anyhow::Result<()> {
+    let executable = env::current_exe()?;
+    let mut command = std::process::Command::new(&executable);
+    command.args(["--restart-all-worker", "--no-server"]);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid is async-signal-safe and only affects the child.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    command.spawn()?;
+    Ok(())
+}
+
 fn rebuild_and_reload(
     manager: Rc<RefCell<ReloadManager>>,
     rebuild_state: Rc<RebuildState>,
@@ -182,10 +209,39 @@ fn rebuild_and_reload(
             .background_executor()
             .spawn(async move { rebuild_ui(force) })
             .await;
-        rebuild_state.finish();
         let outcome = match result {
             Ok(()) => match cx.update(|cx| manager.borrow_mut().reload(cx)) {
                 Ok(()) => Ok(()),
+                Err(error) if is_host_incompatible_reload_error(&error) => {
+                    eprintln!(
+                        "{source} UI reload hit host ABI mismatch ({error:#}); rebuilding host and restarting Jcode Desktop"
+                    );
+                    let host_build = cx
+                        .background_executor()
+                        .spawn(async move { rebuild_ui(false) })
+                        .await;
+                    match host_build {
+                        Ok(()) => match spawn_host_restart_worker() {
+                            Ok(()) => Ok(()),
+                            Err(restart_error) => {
+                                eprintln!(
+                                    "{source} host restart failed after ABI mismatch: {restart_error:#}"
+                                );
+                                Err(format!(
+                                    "{source} host restart failed after ABI mismatch: {restart_error:#}"
+                                ))
+                            }
+                        },
+                        Err(build_error) => {
+                            eprintln!(
+                                "{source} host rebuild failed after ABI mismatch: {build_error:#}"
+                            );
+                            Err(format!(
+                                "{source} host rebuild failed after ABI mismatch: {build_error:#}"
+                            ))
+                        }
+                    }
+                }
                 Err(error) => {
                     eprintln!("{source} UI reload failed after rebuild: {error:#}");
                     Err(format!("{source} UI reload failed after rebuild: {error:#}"))
@@ -196,6 +252,7 @@ fn rebuild_and_reload(
                 Err(format!("{source} UI rebuild failed: {error:#}"))
             }
         };
+        rebuild_state.finish();
         if let Some(reply) = completion {
             reply.send(outcome);
         }
