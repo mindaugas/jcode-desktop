@@ -1,5 +1,69 @@
 # Interaction latency profile
 
+## Streaming-tool work reduction, 2026-11-28 (UTC)
+
+A passive 20-second capture of release host PID 963200 is saved in
+`target/perf-before-opt/`. It recorded 1,493 draws, 5.61 ms mean draw time,
+533 tool-input deltas and 504 workspace bridge notifications. There were no
+input-bearing frames, so this is not evidence about typing latency. `perf`
+was unavailable and `samply` could not attach with the current kernel
+permissions. No system security settings were changed to enable profiling.
+
+This pass removes two concrete sources of streaming work:
+
+- Tool-argument deltas queue the earliest changed tool item and resolve it
+  against the next presentation-row map. Only that suffix loses its cached
+  heights, rather than all conversation history. Resolution after batching
+  preserves modern and legacy tool IDs, out-of-order calls and merged reasoning
+  rows. Structure, font, status and unknown-row changes retain conservative
+  full invalidation. The 100-history-row regression sends 20 chunks and allows
+  at most 60 remeasured rows in total, rather than a whole history per chunk.
+- A changed tool fingerprint no longer replaces the selectable document when
+  its segments are identical. A completed collapsed intent stays reusable
+  while trailing arguments arrive. The regression records 129 fingerprint
+  misses but only one collapsed-document replacement, versus 129 replacements
+  for expanded details. Selection keys, visible errors, order, disclosure and
+  replacement semantics are covered.
+
+Per-view maxima in the live profiler are now explicitly labeled cumulative.
+The earlier 61.7 ms PromptInput maximum may predate the capture and must not be
+reported as a newly observed spike. Draw and input histogram deltas remain
+capture-local. Process lifetime CPU from `ps` is also not a sampled UI-thread
+CPU measurement.
+
+Frozen release binaries and private 120 Hz GPU measurements are under
+`target/perf-opt/`. Two initial steady-stream runs per binary (three half-width
+panels) gave these medians:
+
+| Metric | Baseline | Candidate |
+| --- | ---: | ---: |
+| Mean draw time | 2.71 ms | 2.36 ms |
+| UI-thread CPU | 62.2% | 54.7% |
+| Animation FPS | 120.0 | 120.8 |
+| RSS | 136 MiB | 136 MiB |
+
+An additional alternating baseline/candidate pair measured 2.44/2.48 ms and
+56.5/59.7% UI CPU. Thus the initial apparent improvement is not a reliable
+whole-frame speedup. Concurrent work and differences in the frozen builds
+also prevent attributing all timing differences to this patch. The verified
+result is less invalidation and fewer document replacements, not higher FPS
+or resolution of all live-workspace lag. Broad Workspace/PromptInput render
+churn remains visible in the fixture and warrants a separate profiling pass.
+
+Validation: 1,958 workspace tests passed, 17 ignored. The sidebar streaming
+cache test initially failed under parallel load and passed on its automatic
+isolated retry. Eleven profiler tests and six profiler-consumer tests passed.
+`target/perf-opt/tool-stream-review.png` was rendered with the candidate on
+private Xvfb and visually inspected: tool names, partial intent, transcript,
+sidebar and composer remain present.
+
+The release build succeeded. A state-preserving Ctrl+R reload was attempted,
+but the existing host rejected the new plugin because the shared-global
+identity of `jcode-desktop-api` differs from its loaded version. This requires
+a coordinated Desktop restart, not a forced hot reload. The existing host,
+windows and sessions were left running, so no post-change live-host speedup
+is claimed.
+
 ## Sidebar invalidation follow-up, 2026-11-15
 
 A passive generation-6 capture (`target/live-profile/render-cleanup-gen6/`)
