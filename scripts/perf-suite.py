@@ -12,6 +12,13 @@ user's physical display. No daemon, credentials or input to the user's display.
 
     python3 scripts/perf-suite.py target/perf/run1
     python3 scripts/perf-suite.py target/perf/run2 --baseline target/perf/run1/summary.json
+    python3 scripts/perf-suite.py target/perf/stacks --cpu-stacks --scenario navigate
+
+Optional gperftools capture requires libprofiler.so, not perf/ptrace privileges.
+Each app directory contains cpu.prof.0, cpu.prof.1, etc., mapped to scenarios in
+runs.json. Decode with google-pprof --text <binary> <cpu.prof.N>. Sampling is off
+during startup/setup and enabled only inside the measurement window. Sampled
+timings include uncalibrated overhead and are excluded from baseline checks.
 """
 import argparse
 import hashlib
@@ -22,6 +29,7 @@ import os
 from pathlib import Path
 import random
 import select
+import shutil
 import signal
 import statistics
 import subprocess
@@ -154,14 +162,86 @@ def median_of(runs, key):
     return statistics.median(values) if values else None
 
 
+class CpuStacks:
+    """gperftools in the fixture app only, off until the measurement starts.
+
+    Signal toggles produce cpu.prof.0, cpu.prof.1, etc. Wait for the output FD
+    to close after stopping, rather than terminating the app before its flush.
+    This only reads our child's /proc files, never attaches or changes sysctls.
+    """
+
+    def __init__(self, root, library, frequency):
+        self.base = root / 'cpu.prof'
+        self.library, self.frequency = library, frequency
+        self.active = False
+        self.stopping = False
+        self.index = 0
+        self.path = None
+        self.process = None
+        self.control_seconds = 0
+
+    def environment(self, env):
+        return dict(env, LD_PRELOAD=str(self.library), CPUPROFILE=str(self.base),
+                    CPUPROFILESIGNAL=str(int(signal.SIGUSR2)),
+                    CPUPROFILE_FREQUENCY=str(self.frequency))
+
+    def _output_open(self):
+        for fd in Path(f'/proc/{self.process.pid}/fd').iterdir():
+            try:
+                if fd.readlink() == self.path:
+                    return True
+            except FileNotFoundError:
+                pass  # unrelated FD closed while inspecting our child
+        return False
+
+    def _wait(self, stopped):
+        deadline = time.monotonic() + 10
+        while True:
+            if self.process.poll() is not None:
+                raise RuntimeError('Fixture exited before CPU profile could be flushed')
+            if self.path.exists() and (not stopped or
+                                      (self.path.stat().st_size and not self._output_open())):
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f'CPU profiler did not {"flush" if stopped else "start"}: {self.path}')
+            time.sleep(0.01)
+
+    def start(self, process):
+        if self.active:
+            raise RuntimeError('CPU profiling is already active')
+        self.process = process
+        started = time.monotonic()
+        self.control_seconds = 0
+        self.path = Path(f'{self.base}.{self.index}')
+        self.index += 1
+        self.active = True
+        process.send_signal(signal.SIGUSR2)
+        self._wait(stopped=False)
+        self.control_seconds += time.monotonic() - started
+
+    def stop(self):
+        if not self.active:
+            return
+        started = time.monotonic()
+        if not self.stopping:
+            # Never retry the toggle after a flush timeout: that would restart it.
+            self.stopping = True
+            if self.process.poll() is None:
+                self.process.send_signal(signal.SIGUSR2)
+        self._wait(stopped=True)
+        self.active = self.stopping = False
+        self.control_seconds += time.monotonic() - started
+
+
 class App:
     """The real app on a private Xvfb with an isolated home and fixture data."""
 
     def __init__(self, root, binary, retention, panels, rows, transcript, display='xvfb', sway_prefix=None,
-                 panel_width=None, layout_mode='normal'):
+                 panel_width=None, layout_mode='normal', cpu_library=None, cpu_frequency=100):
         self.root = root
         self.display = display
         self.runtime_alias = None
+        self.cpu_stacks = CpuStacks(root, cpu_library, cpu_frequency) if cpu_library else None
         self.expect_camera = rows and panel_width is not None and panel_width * (panels - 1) > 1
         for name in ('home', 'runtime', 'config', 'cache', 'data', 'jcode'):
             (root / name).mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -306,7 +386,10 @@ class App:
     def _launch(self, name, command, **kwargs):
         log = (self.root / (name + '.log')).open('w')
         self.logs.append(log)
-        process = subprocess.Popen(command, env=self.env, cwd=self.root, stdout=log, stderr=log, **kwargs)
+        # Do not mutate self.env: compositor, keyboard helpers and window manager
+        # must NEVER inherit the preload or profiler settings.
+        env = self.cpu_stacks.environment(self.env) if name == 'app' and self.cpu_stacks else self.env
+        process = subprocess.Popen(command, env=env, cwd=self.root, stdout=log, stderr=log, **kwargs)
         self.processes.append(process)
         return process
 
@@ -395,6 +478,7 @@ class App:
         control.write_text(json.dumps(dict(capture_id=capture,
                                            until_unix_ms=int((time.time() + seconds + 4) * 1000))))
         sampler = typing = sampler_log = None
+        cpu_stacks = getattr(self, 'cpu_stacks', None)
         actions, states, cameras = 0, set(), set()
         try:
             time.sleep(1.2)
@@ -418,6 +502,8 @@ class App:
             before = process_sample(self.app.pid)
             started = time.monotonic()
             deadline = started + seconds
+            if cpu_stacks:
+                cpu_stacks.start(self.app)
             next_key = 0
             next_at = started
             while time.monotonic() < deadline:
@@ -438,21 +524,27 @@ class App:
                     cameras.add(tuple(round(row.get('camera_target', row.get('camera', 0)), 2)
                                       for row in nav['rows']))
                 time.sleep(min(0.03, max(0, deadline - time.monotonic())))
+            if cpu_stacks:
+                cpu_stacks.stop()
             after = process_sample(self.app.pid)
             elapsed = time.monotonic() - started
             if self.display == 'wayland':
                 actions = len(schedule)
         finally:
-            control.unlink(missing_ok=True)
             try:
-                self._stop(typing)
+                if cpu_stacks:
+                    cpu_stacks.stop()
             finally:
-                # Attached samply saves on SIGINT, even on input/app failures.
+                control.unlink(missing_ok=True)
                 try:
-                    self._stop(sampler, signal.SIGINT, timeout=120)
+                    self._stop(typing)
                 finally:
-                    if sampler_log:
-                        sampler_log.close()
+                    # Attached samply saves on SIGINT, even on input/app failures.
+                    try:
+                        self._stop(sampler, signal.SIGINT, timeout=120)
+                    finally:
+                        if sampler_log:
+                            sampler_log.close()
         if profile_to and (not profile_to.exists() or not profile_to.stat().st_size):
             raise RuntimeError(f'samply did not save a profile, see {self.root / f"samply-{capture}.log"}')
         time.sleep(0.3)
@@ -471,6 +563,10 @@ class App:
                       measurement_end_unix_ms=after['unix_ms'], display=self.display,
                       action_count_kind='scheduled' if self.display == 'wayland' else 'dispatched',
                       input_start_delay_seconds=input_lead,
+                      cpu_stack_profile=str(cpu_stacks.path) if cpu_stacks else None,
+                      cpu_profile_control_seconds=cpu_stacks.control_seconds if cpu_stacks else None,
+                      timing_comparable=not (cpu_stacks or profile_to),
+                      sampling_overhead='included, not calibrated' if cpu_stacks or profile_to else None,
                       profile_includes_warmup=bool(profile_to))
         if keys and len(states) < 2:
             raise RuntimeError(f'{capture}: shortcuts did not change the workspace; see {self.root}')
@@ -480,8 +576,12 @@ class App:
 
     def close(self):
         try:
-            for process in reversed(self.processes):
-                self._stop(process)
+            try:
+                if self.cpu_stacks:
+                    self.cpu_stacks.stop()
+            finally:
+                for process in reversed(self.processes):
+                    self._stop(process)
         finally:
             for log in self.logs:
                 log.close()
@@ -507,7 +607,7 @@ def compare(current, baseline, tolerance):
     return worse
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('output', type=Path)
     parser.add_argument('--binary', type=Path, default=Path('target/release/jcode-desktop'))
@@ -530,11 +630,39 @@ def main():
                              'private headless Sway at 120 Hz, for true frame pacing')
     parser.add_argument('--sway-prefix', type=Path, default=Path('target/headless-sway-tools'),
                         help='extracted Sway prefix containing usr/bin and usr/lib, if Sway is not installed')
-    parser.add_argument('--profile', action='store_true',
+    profilers = parser.add_mutually_exclusive_group()
+    profilers.add_argument('--profile', action='store_true',
                         help='record a samply CPU profile of each measured scenario (needs samply)')
-    args = parser.parse_args()
+    profilers.add_argument('--cpu-stacks', action='store_true',
+                           help='preload gperftools ONLY into the private fixture app and sample only '
+                                'the measurement window; sampled timings are not baseline-comparable')
+    parser.add_argument('--cpu-profiler-lib', type=Path,
+                        help='libprofiler.so path (auto-detected by default)')
+    parser.add_argument('--cpu-frequency', type=int, default=100,
+                        help='gperftools CPU samples/second, 1..1000 (default: 100)')
+    args = parser.parse_args(argv)
     if not math.isfinite(args.seconds) or args.seconds < 3 or args.repeats < 1:
         parser.error('need at least 3 seconds and one repeat')
+    if not 1 <= args.cpu_frequency <= 1000:
+        parser.error('--cpu-frequency must be between 1 and 1000')
+    if not args.cpu_stacks and (args.cpu_profiler_lib or args.cpu_frequency != 100):
+        parser.error('--cpu-profiler-lib and --cpu-frequency require --cpu-stacks')
+    if args.cpu_stacks:
+        candidates = [args.cpu_profiler_lib] if args.cpu_profiler_lib else [
+            Path(directory) / name
+            for directory in ('/usr/lib', '/usr/lib64', '/usr/lib/x86_64-linux-gnu',
+                              '/usr/lib/aarch64-linux-gnu', '/usr/local/lib')
+            for name in ('libprofiler.so', 'libprofiler.so.0')]
+        args.cpu_profiler_lib = next((p.resolve() for p in candidates if p.is_file()), None)
+        if not args.cpu_profiler_lib:
+            parser.error('libprofiler not found; supply --cpu-profiler-lib /path/to/libprofiler.so')
+        if any(c.isspace() or c == ':' for c in str(args.cpu_profiler_lib)):
+            parser.error('libprofiler path cannot contain LD_PRELOAD separators (whitespace or colon)')
+    return args
+
+
+def main():
+    args = parse_args()
     binary = args.binary.resolve(strict=True)
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=False, mode=0o700)
@@ -546,11 +674,20 @@ def main():
                 seconds=args.seconds, panels=args.panels, panel_width=args.panel_width, layout_mode=args.layout_mode,
                 transcript=args.transcript, seed=args.seed,
                 display=args.display, private_compositor=True, measurement_version=2,
+                cpu_stack_profiler='gperftools' if args.cpu_stacks else None,
+                cpu_profiler_library=str(args.cpu_profiler_lib) if args.cpu_stacks else None,
+                cpu_profile_frequency=args.cpu_frequency if args.cpu_stacks else None,
+                pprof=shutil.which('google-pprof') or shutil.which('pprof'),
+                timing_comparable=not (args.cpu_stacks or args.profile),
+                sampling_overhead='included, not calibrated' if args.cpu_stacks or args.profile else None,
                 mode=os.environ.get('PERF_SUITE_MODE', '2880x1800@120Hz') if args.display == 'wayland' else '1440x1000',
                 scale=os.environ.get('PERF_SUITE_SCALE', '1.6') if args.display == 'wayland' else '1',
                 renderer=os.environ.get('WLR_RENDERER', 'gles2') if args.display == 'wayland' else 'lavapipe',
                 loadavg=Path('/proc/loadavg').read_text().strip())
     (root / 'capture.json').write_text(json.dumps(meta, indent=2) + '\n')
+    if not meta['timing_comparable']:
+        print('Sampling enabled: CPU/frame timings include uncalibrated profiler overhead. '
+              'Do not compare these timings against unprofiled runs.', flush=True)
 
     runs = {}
     for repeat in range(args.repeats):
@@ -563,7 +700,8 @@ def main():
                     continue
                 tag = f'{"on" if retention else "off"}-{"rows" if rows else "flat"}-{repeat}'
                 app = App(root / tag, binary, retention, args.panels, rows, args.transcript, args.display,
-                          args.sway_prefix.resolve() if args.sway_prefix.exists() else None, args.panel_width, args.layout_mode)
+                          args.sway_prefix.resolve() if args.sway_prefix.exists() else None, args.panel_width, args.layout_mode,
+                          args.cpu_profiler_lib, args.cpu_frequency)
                 try:
                     for scenario in group:
                         keys = scenario_keys(scenario, random.Random(args.seed))
@@ -583,7 +721,8 @@ def main():
 
     metrics = ('animation_fps', 'draws_per_second', 'draw_mean_ms', 'draw_p95_max_ms', 'draw_max_ms',
                'input_max_ms', 'main_thread_cpu_percent', 'cpu_percent', 'rss_mb')
-    summary = {key: {m: median_of(results, m) for m in metrics} | {'runs': len(results)}
+    summary = {key: {m: median_of(results, m) for m in metrics} |
+               {'runs': len(results), 'timing_comparable': meta['timing_comparable']}
                for key, results in runs.items()}
     (root / 'runs.json').write_text(json.dumps(runs, indent=2) + '\n')
     (root / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
@@ -606,6 +745,11 @@ def main():
         profile.print_cause_totals(first.get('causes') or {}, first['seconds'] or 1)
 
     if args.baseline:
+        baseline = json.loads(args.baseline.read_text())
+        if not meta['timing_comparable'] or any(
+                not result.get('timing_comparable', True) for result in baseline.values()):
+            print('\nBaseline comparison skipped: sampled timings are not comparable.')
+            return 0
         baseline_meta = args.baseline.parent / 'capture.json'
         if baseline_meta.exists():
             previous = json.loads(baseline_meta.read_text())
@@ -614,7 +758,7 @@ def main():
             if mismatch:
                 print('\nWarning: baseline workload differs in ' + ', '.join(mismatch)
                       + '. This comparison is exploratory, not like-for-like.')
-        worse = compare(summary, json.loads(args.baseline.read_text()), args.tolerance)
+        worse = compare(summary, baseline, args.tolerance)
         if worse:
             print('\nRegressions against baseline:')
             for line in worse:
@@ -624,5 +768,11 @@ def main():
     return 0
 
 
+def interrupted(signum, frame):
+    # Let measure/close finally blocks flush the private child's CPU profile.
+    raise KeyboardInterrupt(f'Performance suite interrupted by signal {signum}')
+
+
 if __name__ == '__main__':
+    signal.signal(signal.SIGTERM, interrupted)
     sys.exit(main())
