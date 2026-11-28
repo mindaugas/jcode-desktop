@@ -1,5 +1,62 @@
 # Interaction latency profile
 
+## Camera and container work reduction, 2026-11-28 (UTC)
+
+A fixture-only user-space CPU profile collected 6,466 samples without changing
+kernel profiling permissions. Inclusive attribution was approximately 31% in
+prepaint, 28% in paint and 22% in layout requests. Sampled timings are explicitly
+non-comparable: use `scripts/perf-suite.py --cpu-stacks` for attribution, then
+repeat without it for timing. The profiler toggles only around the measurement
+window and flushes before terminating the isolated fixture.
+
+Two follow-up changes target that work without retaining stale scene geometry:
+
+- The horizontal strip stays at layout position zero. A transparent element
+  applies the camera offset during prepaint using GPUI's normal element-offset
+  mechanism. Camera-only movement no longer writes the strip's layout style.
+  Regression coverage checks unchanged layout size, zero layout style writes
+  and measurement calls, translated text and hitboxes, and partially clipped
+  clicks. Children still receive ordinary prepaint and paint.
+- GPUI revision `c2bb7f410ff3a90b859f0c7310b38c0a041ebd89` skips child-bound
+  union queries only for containers whose content bounds have no consumer.
+  Scroll state, tracked handles, prepaint listeners and inspector mode retain
+  the original calculation. A 64-child regression reduces those queries from
+  64 to zero while preserving all 64 child prepaints and identical geometry.
+
+Validation: 401 GPUI tests passed (2 ignored), including four focused engine
+regressions. The integrated Desktop workspace passed 1,964 tests (18 ignored).
+Three retention tests failed under parallel load and passed on isolated runner
+retries. All 23 Python performance-tool tests passed. The release candidate is
+frozen as `target/perf-opt/navigation-final`.
+
+Unsampled native GPU captures used six half-width panels, the `all` transcript,
+93 shortcut actions per 12-second capture and the same private 120 Hz compositor.
+Three-run batch medians, in chronological order:
+
+| Metric | Before 1 | Candidate 1 | Before 2 | Candidate 2 |
+| --- | ---: | ---: | ---: | ---: |
+| Animation FPS | 109.3 | 88.0 | 91.6 | 90.2 |
+| Mean draw time | 5.39 ms | 7.43 ms | 7.23 ms | 7.59 ms |
+| UI-thread CPU | 56.8% | 65.8% | 65.6% | 68.3% |
+| Input-to-frame maximum, median of runs | 42.1 ms | 48.6 ms | 47.1 ms | 44.6 ms |
+
+Artifacts: `target/perf-opt/nav-offset-before-1/`,
+`nav-final-after-1/`, `nav-final-before-2/`, `nav-final-after-2/`.
+These results do **not** establish a navigation speedup. Candidate draws were
+slower in these batches; the older binary also slowed substantially during
+remeasurement. A camera-only isolation capture varied from 116.1 FPS / 5.11 ms
+to 88.5 FPS / 7.44 ms across two consecutive runs (`nav-camera-only/`). Concurrent
+checkout changes and system variability prevent attribution of that difference
+to either optimization. The deterministic work reductions above are verified,
+but smoother whole-app navigation remains unproven, not a completed outcome.
+
+The final private-Xvfb native focus check selected panel 2 successfully;
+`navigation-final-review.png` was inspected with intact table/code/math content,
+three composers and correct active panel. Ctrl+R rebuilt successfully in 4.34 s
+and staged generation 9, but host PID 963200 rejected it because its GPUI
+revision differs. A compatible host restart is required to activate these
+changes. No running host was killed or state reset, and no live speedup is claimed.
+
 ## Panel-navigation follow-up, 2026-11-28 (UTC)
 
 Left/right navigation was reproduced on a private GPU compositor, not by
