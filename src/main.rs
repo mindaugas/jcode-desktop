@@ -169,7 +169,9 @@ fn is_host_incompatible_reload_error(error: &anyhow::Error) -> bool {
 }
 
 fn spawn_host_restart_worker() -> anyhow::Result<()> {
-    let executable = env::current_exe()?;
+    // Rebuilds replace the executable inode. Linux current_exe then ends in
+    // " (deleted)", so use the shared relaunch-safe path to the rebuilt host.
+    let executable = jcode_desktop_harness::platform::self_executable()?;
     let mut command = std::process::Command::new(&executable);
     command.args(["--restart-all-worker", "--no-server"]);
     command

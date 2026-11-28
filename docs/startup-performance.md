@@ -138,13 +138,84 @@ TUI profiler's documented pyte environment. Startup activation has a headless
 regression test proving that it waits for the second frame callback without
 adding a fixed timer.
 
-## Host delivery constraint
+To reproduce the first-window comparisons:
 
-The running host's Ctrl+R rebuild succeeded, but activation was safely rejected
-because its existing `jcode-desktop-api` shared-global identity differs from
-the checkout. The identity guard was not bypassed and active windows were not
-restarted or discarded. Startup changes in the host require the next normal
-full launch regardless of UI hot reload.
+```sh
+# TUI: use the documented isolated pyte environment.
+target/tui-startup-venv/bin/python scripts/profile-tui-startup.py \
+  --runs 10 --json-out target/tui-first-output.json
+# Native Wayland, with extracted Sway tools and real Intel GPU composition.
+python3 scripts/profile-wayland-startup.py target/wayland-default \
+  --samples 5 --single-panel --compositor-renderer gles2 \
+  --render-node /dev/dri/renderD128 \
+  --driver /usr/share/vulkan/icd.d/intel_icd.json --require-hardware
+# Repeat with the same binary and all four flags set to 0 for the control:
+# --gpui-early-present 0 --gpui-background-fonts 0
+# --gpui-vulkan-first 0 --jcode-desktop-early-window 0
+# Alternate individual control/candidate launches to reduce load/order bias.
+```
+
+## Native Wayland shell before GPU initialization
+
+The final renderer (`77d28176`) commits an opaque shared-memory buffer to the
+**same actual Wayland toplevel** before creating a graphics device. It is not a
+second splash window. The initial configure is acknowledged once, subsequent
+configure events reach normal window handling, and WGPU replaces the immutable
+bootstrap buffer. Native buffer allocation is bounded, hidden windows and popups
+are excluded, and a 12 ms configure deadline falls back to normal initialization.
+Event forwarding is installed at object construction, avoiding callback replacement
+and preserving normal queue dispatch without reentrant application callbacks.
+
+Five alternating same-binary Intel/native-Wayland pairs measured:
+
+| Metric | Policies off | Policies on |
+| --- | ---: | ---: |
+| First mapped native window, median | 144.3 ms | **10.3 ms** |
+| First mapped native window, p95 | 149.2 ms | **11.0 ms** |
+| Focused-panel diagnostic, median | 189.4 ms | 129.4 ms |
+
+All five paired first-window comparisons improved. Median paired reduction was
+133.5 ms. Native typing passed in the first control/candidate pair. These timings
+include spawning the executable, with fresh private application/shader caches
+but retained OS page caches. The compositor is already running in both cases.
+A mapped native window is stronger evidence than a startup log, but is still not
+a measurement of physical display scanout.
+
+Evidence: `target/early-native-final-pairs/results.json`, binary SHA-256
+`ba3a6611959cad59d02027ccad5e45f34724c36741045e43ef6b8c9b99ab01f2`.
+The earlier 79 ms checkpoint and this final comparison were measured under
+different laptop load, so the reported improvement uses each run's own paired
+control rather than subtracting unrelated historical medians.
+
+A contemporaneous ten-launch TUI repeat measured **12.9 ms** median first
+meaningful text and 70.7 ms rendered probe input (`target/tui-native-final.json`).
+Thus the native-window target is met in this isolated environment, without
+claiming that full Desktop content or input readiness beats the TUI. The normal
+multi-panel window also mapped at 11.0/11.7 ms and passed native typing in both
+launches (`target/wl-main-final`). A software-rendered Wayland launch mapped at
+9.6 ms and passed typing (`target/wl-soft-final`). The benchmark now recognizes
+`startup://draft` as editable rather than incorrectly waiting for a server-backed
+session before testing native input.
+
+Final checks: 71 Linux native-window tests, 67 renderer tests, and 28 Python
+benchmark tests. Desktop workspace: 1,966 passed, 18 ignored, with three unrelated
+parallel-test flakes passing isolated retries. Real native typing, first-map
+observation, hardware device checks, software fallback, loading-pill screenshots,
+and final workspace screenshots were checked separately from unit tests.
+
+## Host delivery
+
+The original host correctly rejected an incompatible UI-only reload. Its automatic
+restart then exposed a Linux replaced-executable path ending in ` (deleted)`.
+The host now reuses the existing tested relaunch-safe executable helper.
+
+The built-in recovery restart was run without restarting the Jcode backend.
+Preflight confirmed there were no embedded terminals to lose. All three windows
+and seven panels were restored, and session identities, row assignments, and
+widths were compared before and after. Host PIDs changed from 1466939/1466940 to
+1521624/1521625. The private verification records remain under
+`target/startup-restart-{before,after}.json`. This verifies a full-host update,
+not merely a rebuild acknowledgement or an offline screenshot.
 
 Raw local evidence is in `target/startup-*`; benchmark JSON records binary hashes,
 sample timings, selected graphics device, and native-input proof independently.

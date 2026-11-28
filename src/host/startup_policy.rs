@@ -1,5 +1,6 @@
 //! Linux startup policy. Explicit environment overrides always win.
 
+#[cfg(any(target_os = "linux", test))]
 const DEFAULTS: &[&str] = &[
     "GPUI_EARLY_PRESENT",
     "GPUI_BACKGROUND_FONTS",
@@ -7,6 +8,7 @@ const DEFAULTS: &[&str] = &[
     "JCODE_DESKTOP_EARLY_WINDOW",
 ];
 
+#[cfg(any(target_os = "linux", test))]
 fn missing_defaults(mut exists: impl FnMut(&str) -> bool) -> Vec<&'static str> {
     DEFAULTS
         .iter()

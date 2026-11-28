@@ -72,6 +72,12 @@ def changed_client_pixels(before, after, rect):
     return ImageChops.difference(previous, current).getbbox() is not None
 
 
+def editable_panel(panel):
+    return bool(panel and (panel.get('session') == 'startup://draft' or
+                           (panel.get('session', '').startswith('session_') and
+                            panel.get('history_loaded'))))
+
+
 def sample_env(root, jcode, driver, args):
     env = shared.sample_env(root, jcode, driver, args.timeout, trace_startup=True)
     env.update(WLR_BACKENDS='headless', WLR_RENDERER=args.compositor_renderer, WLR_LIBINPUT_NO_DEVICES='1',
@@ -165,9 +171,8 @@ def run_sample(root, index, args, binary, jcode, driver):
             panel = shared.focused_panel(shared.navigation(root / 'state'))
             if panel and panel.get('session') == 'desktop://changelog':
                 key('-M', 'ctrl', '-M', 'shift', '-k', 'w', '-m', 'shift', '-m', 'ctrl')
-            wait(lambda: (p := shared.focused_panel(shared.navigation(root / 'state'))) and
-                 p.get('session', '').startswith('session_') and p.get('history_loaded'),
-                 'connected editable panel')
+            wait(lambda: editable_panel(shared.focused_panel(shared.navigation(root / 'state'))),
+                 'editable panel')
             # Input is an eventual correctness check, outside startup endpoints.
             # Give the new virtual keyboard enter/keymap time to reach GPUI.
             time.sleep(.5)

@@ -24,6 +24,13 @@ class WaylandStartupTests(unittest.TestCase):
         self.assertIsNone(profile.desktop_node(dict(node, visible=False), 123))
         self.assertIsNone(profile.desktop_node(dict(node, app_id=None), 123))
 
+    def test_startup_draft_is_editable_without_connected_history(self):
+        self.assertTrue(profile.editable_panel({'session': 'startup://draft', 'history_loaded': False}))
+        self.assertTrue(profile.editable_panel({'session': 'session_test', 'history_loaded': True}))
+        self.assertFalse(profile.editable_panel({'session': 'session_test', 'history_loaded': False}))
+        self.assertFalse(profile.editable_panel({'session': 'desktop://changelog', 'history_loaded': True}))
+        self.assertFalse(profile.editable_panel(None))
+
     def test_pixels_restricted_to_client(self):
         before = Image.new('RGB', (20, 20))
         after = before.copy()
