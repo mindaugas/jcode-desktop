@@ -1,5 +1,52 @@
 # Interaction latency profile
 
+## Scene-bounds insertion follow-up, 2026-11-28 (UTC)
+
+GPUI `dfe07878a11c40a76863f8ece165a764b1033c06` avoids rescanning every sibling
+node to find a maximum already known from the insertion path. Splits retain the
+general selection algorithm. Spatial overlap queries, bounds unions, splitting,
+frame replay and assigned draw order are unchanged. Differential tests compare
+against the upstream tree and a brute-force overlap oracle, including deep
+splits, ties, translation, reordering, truncation and degenerate bounds.
+
+The engine's reproducible release benchmark uses 4,096 bounds per frame, 30
+frames per sample, nine samples per process and three paired process medians,
+pinned to CPU 3. Before/after nanoseconds per insertion were 214.8/209.6 for
+disjoint grids, 224.6/219.2 for overlapping grids, 67.5/49.1 for identical bounds,
+646.5/640.1 for seeded random bounds and 61.1/56.4 for full-width rows. These are
+**isolated insertion reductions**, not claims of 2–27% faster Desktop navigation.
+Full methodology is in the GPUI repository's
+`crates/gpui_perf/examples/bounds_tree.md`. All 405 GPUI library tests passed,
+with three intentionally ignored tests.
+
+Desktop integration passed 1,963 workspace tests (18 ignored). Two retention
+tests passed on the runner's isolated retries after failing under parallel load.
+Native private-Xvfb focus selected panel 2; the inspected screenshot preserved
+panel boundaries, table/code/math content and all three composers.
+
+Five unsampled native GPU captures per binary, grouped in forward then reverse
+order, used six half-width panels and 93 shortcuts per 12-second capture:
+
+| Batch medians | Before, 3 runs | After, 3 runs | After, 2 runs | Before, 2 runs |
+| --- | ---: | ---: | ---: | ---: |
+| Mean draw time | 3.78 ms | 3.19 ms | 7.07 ms | 7.77 ms |
+| Animation FPS | 120.6 | 122.4 | 93.8 | 88.0 |
+| UI-thread CPU | 44.9% | 39.1% | 64.7% | 63.8% |
+| Input-to-frame maximum, median of runs | 21.1 ms | 18.7 ms | 46.7 ms | 44.1 ms |
+
+Artifacts: `target/perf-opt/nav-bounds-{before,after}/` and corresponding
+`-reverse/` directories, with hashes and capture metadata. Draw time was lower
+with the new engine in both batches, but large cross-batch drift and mixed
+input/CPU results preclude attributing the full difference to this change or
+claiming all navigation stutter is fixed. The hosted headless phase check was
+essentially unchanged: p50 1.84/1.86 ms and p95 2.60/2.64 ms before/after.
+The reliable quantitative claim remains the isolated bounds-insertion reduction.
+
+The final Ctrl+R rebuild succeeded in 2.79 s and staged generation 12. Host
+PID 963200 rejected it because its GPUI revision differs. Activation and live
+navigation acceptance therefore remain blocked on a coordinated compatible-host
+restart. Existing sessions/windows were preserved, not forcibly restarted.
+
 ## Camera and container work reduction, 2026-11-28 (UTC)
 
 A fixture-only user-space CPU profile collected 6,466 samples without changing
@@ -75,6 +122,19 @@ The camera wrapper was withdrawn rather than retaining an optimization whose
 whole-app measurements were repeatedly worse or inconclusive. Normal layout
 positioning is restored. The safe engine content-bounds shortcut and parsing
 cache remain. Subsequent work targets measured scene-bounds insertion costs.
+
+Rollback validation passed 1,963 workspace tests (18 ignored). The restored
+three-panel native focus fixture and screenshot passed. A release headless
+navigation profile measured p50 1.84 ms, p95 2.60 ms, with average build/prepaint/
+paint/layout of 0.24/0.75/0.67/0.06 ms. This is a different backend and machine,
+not comparable to the GPU milliseconds above. The next Ctrl+R rebuild completed
+in 36.25 s, but generation 10 was again rejected for the host GPUI mismatch.
+
+A passive 20-second capture of the unchanged live host at 04:06 UTC recorded
+19 draws averaging 2.94 ms (5.69 ms maximum), no input-bearing frames and no
+animation intervals. All 196 sampling windows were inactive. This confirms
+neither navigation latency nor a live improvement; no input was injected into
+the user's windows. Raw capture: `target/perf-opt/live-follow-up/`.
 
 ## Panel-navigation follow-up, 2026-11-28 (UTC)
 
